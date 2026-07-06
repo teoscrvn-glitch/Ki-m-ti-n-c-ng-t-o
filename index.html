@@ -1,0 +1,958 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TaskEarn — Kiếm Tiền Thật</title>
+<link href="https://fonts.googleapis.com/css2?family=Be+Vietnam+Pro:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<script src="https://openfpcdn.io/fingerprintjs/v4/iife.min.js"></script>
+<script src="https://www.google.com/recaptcha/api.js?render=YOUR_RECAPTCHA_SITE_KEY"></script>
+<script src="https://unpkg.com/lucide@latest/dist/umd/lucide.js"></script>
+
+<script type="module">
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+  import { getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword, signOut,
+           onAuthStateChanged, updatePassword, updateEmail, reauthenticateWithCredential, EmailAuthProvider }
+                          from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+  import { getFirestore, doc, getDoc, setDoc, updateDoc, collection, getDocs, query, orderBy, limit, onSnapshot, serverTimestamp }
+                          from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+  import { getFunctions, httpsCallable } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-functions.js";
+  // App Check — bỏ comment sau khi cấu hình trong Firebase Console (xem README)
+  // import { initializeAppCheck, ReCaptchaV3Provider } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app-check.js";
+
+  const firebaseConfig = {
+    apiKey: "THAY_API_KEY", authDomain: "THAY_AUTH_DOMAIN", projectId: "THAY_PROJECT_ID",
+    storageBucket: "THAY_STORAGE_BUCKET", messagingSenderId: "THAY_SENDER_ID", appId: "THAY_APP_ID"
+  };
+  const RECAPTCHA_SITE_KEY = "YOUR_RECAPTCHA_SITE_KEY";
+
+  const app       = initializeApp(firebaseConfig);
+  const auth      = getAuth(app);
+  const db        = getFirestore(app);
+  const functions = getFunctions(app, "asia-southeast1");
+
+  // ── App Check (đang tắt trên client — xem README để bật) ──
+  // initializeAppCheck(app, { provider: new ReCaptchaV3Provider("APP_CHECK_SITE_KEY"), isTokenAutoRefreshEnabled: true });
+
+  const fnRegisterDevice        = httpsCallable(functions, "registerDevice");
+  const fnStartTaskSession      = httpsCallable(functions, "startTaskSession");
+  const fnProcessClaim          = httpsCallable(functions, "processClaim");
+  const fnProcessWithdraw       = httpsCallable(functions, "processWithdraw");
+  const fnRecordSecurityChange  = httpsCallable(functions, "recordSecurityChange");
+  const fnSavePaymentProfile    = httpsCallable(functions, "savePaymentProfile");
+  const fnGetPaymentProfile     = httpsCallable(functions, "getPaymentProfile");
+  const fnCancelWithdraw        = httpsCallable(functions, "cancelWithdraw");
+
+  let currentUser = null;
+  let userData    = null;
+  let deviceId    = null;
+
+  async function getDeviceId() {
+    if (deviceId) return deviceId;
+    try {
+      const fp = await FingerprintJS.load();
+      const result = await fp.get();
+      deviceId = result.visitorId;
+    } catch (e) {
+      deviceId = "fallback_" + Math.random().toString(36).slice(2) + Date.now().toString(36);
+    }
+    return deviceId;
+  }
+
+  function collectExtendedFingerprint() {
+    try {
+      return {
+        userAgent: navigator.userAgent || "", platform: navigator.platform || "",
+        hardwareConcurrency: navigator.hardwareConcurrency || 0, deviceMemory: navigator.deviceMemory || 0,
+        screenWidth: screen.width || 0, screenHeight: screen.height || 0, colorDepth: screen.colorDepth || 0,
+        timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "", language: navigator.language || "",
+        languagesCount: (navigator.languages || []).length,
+      };
+    } catch (e) { return {}; }
+  }
+
+  function collectAutomationSignals() {
+    try {
+      return {
+        webdriver: navigator.webdriver === true, pluginsCount: (navigator.plugins || []).length,
+        languagesCount: (navigator.languages || []).length, hasChrome: typeof window.chrome !== "undefined",
+        isChrome: /Chrome/.test(navigator.userAgent) && !/Edg|OPR/.test(navigator.userAgent),
+        outerWidth: window.outerWidth || 0, outerHeight: window.outerHeight || 0,
+      };
+    } catch (e) { return {}; }
+  }
+
+  function getRecaptchaToken(action) {
+    return new Promise((resolve) => {
+      if (RECAPTCHA_SITE_KEY === "YOUR_RECAPTCHA_SITE_KEY" || !window.grecaptcha) { resolve(""); return; }
+      grecaptcha.ready(() => {
+        grecaptcha.execute(RECAPTCHA_SITE_KEY, { action }).then(resolve).catch(() => resolve(""));
+      });
+    });
+  }
+
+  onAuthStateChanged(auth, async (user) => {
+    if (user) {
+      currentUser = user;
+      await getDeviceId();
+      await loadUserData();
+      showApp();
+    } else {
+      currentUser = null;
+      showAuth();
+    }
+  });
+
+  async function loadUserData() {
+    const ref  = doc(db, "users", currentUser.uid);
+    const snap = await getDoc(ref);
+    if (!snap.exists()) {
+      await setDoc(ref, { email: currentUser.email, balance: 0, todayEarned: 0, totalEarned: 0, createdAt: serverTimestamp() });
+      userData = { balance: 0, todayEarned: 0, totalEarned: 0 };
+    } else {
+      userData = snap.data();
+    }
+    renderDashboard();
+  }
+
+  function renderDashboard() {
+    const bal = formatVND(userData.balance || 0);
+    setText("balance-display-home", bal);
+    setText("balance-display-withdraw", bal);
+    setText("today-display", formatVND(userData.todayEarned || 0));
+    setText("total-display", formatVND(userData.totalEarned || 0));
+    setText("user-email", currentUser.email);
+    setText("user-greeting-name", (currentUser.email || "").split("@")[0]);
+    setText("account-email-display", currentUser.email);
+  }
+  function setText(id, val) { const el = document.getElementById(id); if (el) el.textContent = val; }
+  function formatVND(amount) { return new Intl.NumberFormat("vi-VN").format(amount) + "đ"; }
+
+  function todayVN() { return new Date(Date.now() + 7 * 3600_000).toISOString().slice(0, 10); }
+  function secondsUntilResetVN() {
+    const nowVN = new Date(Date.now() + 7 * 3600_000);
+    const tomorrow = new Date(Date.UTC(nowVN.getUTCFullYear(), nowVN.getUTCMonth(), nowVN.getUTCDate() + 1));
+    return Math.max(0, Math.floor((tomorrow.getTime() - nowVN.getTime()) / 1000));
+  }
+  function formatCountdown(totalSec) {
+    const h = Math.floor(totalSec / 3600), m = Math.floor((totalSec % 3600) / 60);
+    return `${h}h${m.toString().padStart(2, "0")}p`;
+  }
+
+  // ── TASKS ──
+  async function loadTasks() {
+    document.getElementById("tasks-container").innerHTML = skeletonTaskCards(3);
+    const snap  = await getDocs(collection(db, "tasks"));
+    const tasks = [];
+    snap.forEach(d => tasks.push({ id: d.id, ...d.data() }));
+
+    const today = todayVN();
+    const doneSnap = await getDocs(collection(db, "users", currentUser.uid, "completedTasks"));
+    const doneTaskIdsToday = new Set();
+    doneSnap.forEach(d => {
+      const idx = d.id.lastIndexOf("_");
+      if (idx === -1) return;
+      const taskId = d.id.slice(0, idx), date = d.id.slice(idx + 1);
+      if (date === today) doneTaskIdsToday.add(taskId);
+    });
+    renderTasks(tasks, doneTaskIdsToday);
+  }
+
+  function skeletonTaskCards(n) {
+    return Array(n).fill(0).map(() => `
+      <div class="task-card skeleton-card">
+        <div class="skel skel-title"></div>
+        <div class="skel skel-desc"></div>
+        <div class="skel skel-btn"></div>
+      </div>`).join("");
+  }
+
+  function renderTasks(tasks, doneIds) {
+    const container = document.getElementById("tasks-container");
+    const active = tasks.filter(t => t.active);
+    if (active.length === 0) {
+      container.innerHTML = emptyState("clipboard-x", "Chưa có nhiệm vụ nào", "Quay lại sau nhé, nhiệm vụ mới sẽ sớm xuất hiện ở đây!");
+      return;
+    }
+    const resetIn = formatCountdown(secondsUntilResetVN());
+    container.innerHTML = active.map((task, i) => {
+      const done = doneIds.has(task.id);
+      return `
+      <div class="task-card ${done ? "done" : ""}" data-taskid="${task.id}" style="animation-delay:${i * 60}ms">
+        <div class="task-icon-wrap"><i data-lucide="${done ? "check-circle-2" : "zap"}"></i></div>
+        <div class="task-body">
+          <div class="task-header">
+            <span class="task-title">${task.title}</span>
+            <span class="task-reward">+${formatVND(task.reward)}</span>
+          </div>
+          <p class="task-desc">${task.description || ""}</p>
+          ${done
+            ? `<button class="btn-task done-btn" disabled><i data-lucide="clock"></i> Mở lại sau ${resetIn}</button>`
+            : `<button class="btn-task" onclick="window.startTask('${task.id}', this)">Nhận nhiệm vụ <i data-lucide="arrow-right"></i></button>`
+          }
+        </div>
+      </div>`;
+    }).join("");
+    renderIcons();
+  }
+
+  function emptyState(icon, title, sub) {
+    return `<div class="empty-state">
+      <div class="empty-icon"><i data-lucide="${icon}"></i></div>
+      <div class="empty-title">${title}</div>
+      <div class="empty-sub">${sub}</div>
+    </div>`;
+  }
+
+  // ── START TASK ──
+  window.startTask = async (taskId, btn) => {
+    btn.disabled = true;
+    btn.innerHTML = `<span class="btn-spinner"></span> Đang tải...`;
+    try {
+      const devId  = await getDeviceId();
+      const result = await fnStartTaskSession({ taskId, deviceId: devId });
+      const { token, reward, bypassUrl } = result.data;
+      const openedAt = new Date();
+
+      btn.innerHTML = `<span class="btn-spinner"></span> Đang chờ xác nhận...`;
+      window.open(bypassUrl, "_blank");
+      showToast("info", "clock", "Vượt link xong rồi quay lại bấm xác nhận!");
+      setTimeout(() => showClaimModal(taskId, reward, token, openedAt), 15_000);
+    } catch (err) {
+      showToast("error", "alert-circle", err.message || "Không thể bắt đầu nhiệm vụ, thử lại!");
+      btn.disabled = false;
+      btn.innerHTML = `Nhận nhiệm vụ <i data-lucide="arrow-right"></i>`;
+      renderIcons();
+    }
+  };
+
+  function showClaimModal(taskId, reward, token, openedAt) {
+    document.getElementById("modal-overlay").classList.add("show");
+    document.getElementById("modal-reward").textContent = formatVND(reward);
+    window._pendingTaskId = taskId;
+    window._pendingToken  = token;
+    window._pendingOpenedAt = openedAt;
+    window._pendingIdemKey = crypto.randomUUID ? crypto.randomUUID() : (Date.now().toString(36) + Math.random().toString(36).slice(2));
+  }
+
+  const CLAIM_COOLDOWN_MS = 30_000;
+  let lastClaimTime = 0, isClaiming = false;
+
+  window.claimReward = async () => {
+    if (isClaiming) { showToast("error", "alert-circle", "Đang xử lý, vui lòng chờ..."); return; }
+    const now = Date.now();
+    if (now - lastClaimTime < CLAIM_COOLDOWN_MS) {
+      showToast("error", "alert-circle", `Chờ ${Math.ceil((CLAIM_COOLDOWN_MS - (now - lastClaimTime)) / 1000)}s trước khi claim tiếp!`); return;
+    }
+    const elapsed = (Date.now() - window._pendingOpenedAt.getTime()) / 1000;
+    if (elapsed < 45) { showToast("error", "alert-circle", `Chờ thêm ${Math.ceil(45 - elapsed)}s nữa!`); return; }
+
+    isClaiming = true;
+    const btn = document.getElementById("btn-claim-confirm");
+    btn.disabled = true;
+    btn.innerHTML = `<span class="btn-spinner"></span> Đang xử lý...`;
+
+    try {
+      const devId = await getDeviceId();
+      const recaptchaToken = await getRecaptchaToken("claim");
+      const result = await fnProcessClaim({
+        taskId: window._pendingTaskId, token: window._pendingToken, deviceId: devId, recaptchaToken,
+        automationSignals: collectAutomationSignals(), idempotencyKey: window._pendingIdemKey,
+      });
+      lastClaimTime = Date.now();
+      closeModal();
+      showToast("success", "check-circle-2", `Đã gửi claim! Chờ duyệt để nhận ${formatVND(result.data.reward)}.`);
+      await loadUserData();
+      loadTasks();
+    } catch (err) {
+      showToast("error", "alert-circle", err.message || "Lỗi kết nối, vui lòng thử lại!");
+    } finally {
+      isClaiming = false;
+      btn.disabled = false;
+      btn.innerHTML = `<i data-lucide="check"></i> Xác nhận`;
+      renderIcons();
+    }
+  };
+
+  window.closeModal = () => document.getElementById("modal-overlay").classList.remove("show");
+
+  // ── WITHDRAW ──
+  let isWithdrawing = false, withdrawIdemKey = null;
+  let cachedPaymentProfile = null;
+
+  /** Tải & hiển thị Payment Profile trên trang Rút tiền + trang Tài khoản */
+  async function loadPaymentProfile() {
+    try {
+      const result = await fnGetPaymentProfile();
+      cachedPaymentProfile = result.data.exists ? result.data.profile : null;
+    } catch (e) { cachedPaymentProfile = null; }
+    renderPaymentProfileUI();
+  }
+
+  function renderPaymentProfileUI() {
+    const withdrawBox = document.getElementById("withdraw-profile-box");
+    const accountBox  = document.getElementById("account-profile-box");
+    if (cachedPaymentProfile) {
+      const p = cachedPaymentProfile;
+      const html = `
+        <div class="profile-row"><i data-lucide="landmark"></i><div><div class="profile-row-label">Ngân hàng</div><div class="profile-row-val">${escHtml(p.bankName)}</div></div></div>
+        <div class="profile-row"><i data-lucide="credit-card"></i><div><div class="profile-row-label">Số tài khoản</div><div class="profile-row-val">${escHtml(p.bankAccount)}</div></div></div>
+        <div class="profile-row"><i data-lucide="user"></i><div><div class="profile-row-label">Chủ tài khoản</div><div class="profile-row-val">${escHtml(p.bankHolder)}</div></div></div>
+        ${p.branch ? `<div class="profile-row"><i data-lucide="map-pin"></i><div><div class="profile-row-label">Chi nhánh</div><div class="profile-row-val">${escHtml(p.branch)}</div></div></div>` : ""}
+      `;
+      if (withdrawBox) withdrawBox.innerHTML = `<div class="profile-card">${html}<button class="link-btn" onclick="navigateTo('account')">Đổi hồ sơ thanh toán</button></div>`;
+      if (accountBox)  accountBox.innerHTML  = `<div class="profile-card">${html}</div>`;
+    } else {
+      const emptyHtml = `<div class="profile-card empty"><i data-lucide="alert-triangle"></i><span>Bạn chưa thiết lập hồ sơ thanh toán</span></div>`;
+      if (withdrawBox) withdrawBox.innerHTML = emptyHtml;
+      if (accountBox)  accountBox.innerHTML  = "";
+    }
+    renderIcons();
+  }
+
+  function escHtml(str) {
+    if (typeof str !== "string") return String(str ?? "");
+    return str.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#039;");
+  }
+
+  window.submitWithdraw = async () => {
+    if (isWithdrawing) return;
+    if (!cachedPaymentProfile) {
+      showToast("error", "alert-circle", "Vui lòng thiết lập hồ sơ thanh toán trước khi rút tiền!");
+      navigateTo("account");
+      return;
+    }
+    const amount = parseInt(document.getElementById("withdraw-amount").value);
+    if (!amount || amount < 100_000) { showToast("error", "alert-circle", "Số tiền rút tối thiểu là 100.000đ"); return; }
+
+    isWithdrawing = true;
+    const withdrawBtn = document.getElementById("btn-submit-withdraw");
+    withdrawBtn.disabled = true;
+    withdrawBtn.innerHTML = `<span class="btn-spinner"></span> Đang xử lý...`;
+    if (!withdrawIdemKey) withdrawIdemKey = crypto.randomUUID ? crypto.randomUUID() : (Date.now().toString(36) + Math.random().toString(36).slice(2));
+
+    try {
+      const devId = await getDeviceId();
+      const recaptchaToken = await getRecaptchaToken("withdraw");
+      // Chỉ gửi số tiền — thông tin ngân hàng server tự lấy từ Payment Profile đã lưu
+      const wResult = await fnProcessWithdraw({
+        amount, recaptchaToken, deviceId: devId,
+        automationSignals: collectAutomationSignals(), idempotencyKey: withdrawIdemKey,
+      });
+      withdrawIdemKey = null;
+      await loadUserData();
+      if (wResult.data.needsReview) showToast("info", "shield-alert", "Lệnh rút đã gửi! Có dấu hiệu cần xét duyệt kỹ hơn, có thể mất thêm thời gian.");
+      else showToast("success", "check-circle-2", "Lệnh rút thành công! Tiền về trong 12 ngày.");
+      document.getElementById("withdraw-amount").value = "";
+      navigateTo("home");
+    } catch (err) {
+      showToast("error", "alert-circle", err.message || "Lỗi kết nối, vui lòng thử lại!");
+    } finally {
+      isWithdrawing = false;
+      withdrawBtn.disabled = false;
+      withdrawBtn.innerHTML = `<i data-lucide="send"></i> Gửi lệnh rút tiền`;
+      renderIcons();
+    }
+  };
+
+  // ── HỒ SƠ THANH TOÁN ──
+  let isSavingProfile = false;
+  window.submitPaymentProfile = async () => {
+    if (isSavingProfile) return;
+    const bankName    = document.getElementById("pp-bank-name").value.trim();
+    const bankAccount = document.getElementById("pp-bank-account").value.trim();
+    const bankHolder  = document.getElementById("pp-bank-holder").value.trim();
+    const branch      = document.getElementById("pp-branch").value.trim();
+
+    if (!bankName || !bankAccount || !bankHolder) { showToast("error", "alert-circle", "Vui lòng điền đầy đủ ngân hàng, số tài khoản, chủ tài khoản!"); return; }
+
+    isSavingProfile = true;
+    const btn = document.getElementById("btn-save-profile");
+    btn.disabled = true; btn.innerHTML = `<span class="btn-spinner"></span> Đang lưu...`;
+    try {
+      const result = await fnSavePaymentProfile({ bankName, bankAccount, bankHolder, branch });
+      if (result.data.withdrawLocked) {
+        showToast("info", "shield-alert", `Đã lưu hồ sơ! Rút tiền tạm khoá ${result.data.withdrawLockedForHours}h để bảo vệ bạn.`);
+      } else {
+        showToast("success", "check-circle-2", "Đã lưu hồ sơ thanh toán!");
+      }
+      ["pp-bank-name", "pp-bank-account", "pp-bank-holder", "pp-branch"].forEach(id => document.getElementById(id).value = "");
+      await loadPaymentProfile();
+    } catch (err) {
+      showToast("error", "alert-circle", err.message || "Lỗi lưu hồ sơ, vui lòng thử lại!");
+    } finally {
+      isSavingProfile = false;
+      btn.disabled = false; btn.innerHTML = `<i data-lucide="save"></i> Lưu hồ sơ thanh toán`;
+      renderIcons();
+    }
+  };
+
+  // ── AUTH ──
+  window.doLogin = async () => {
+    const email = document.getElementById("auth-email").value.trim();
+    const pass  = document.getElementById("auth-pass").value;
+    if (!email || !pass) { showToast("error", "alert-circle", "Nhập email và mật khẩu!"); return; }
+    try {
+      await signInWithEmailAndPassword(auth, email, pass);
+      const devId = await getDeviceId();
+      const recaptchaToken = await getRecaptchaToken("login");
+      await fnRegisterDevice({
+        deviceId: devId, recaptchaToken, isRegister: false,
+        extendedFingerprint: collectExtendedFingerprint(), automationSignals: collectAutomationSignals(),
+      }).catch(() => {});
+    } catch (e) {
+      showToast("error", "alert-circle", "Email hoặc mật khẩu sai!");
+    }
+  };
+
+  window.doRegister = async () => {
+    const email = document.getElementById("auth-email").value.trim();
+    const pass  = document.getElementById("auth-pass").value;
+    if (!email) { showToast("error", "alert-circle", "Nhập email!"); return; }
+    if (pass.length < 6) { showToast("error", "alert-circle", "Mật khẩu tối thiểu 6 ký tự!"); return; }
+    try {
+      const cred = await createUserWithEmailAndPassword(auth, email, pass);
+      const devId = await getDeviceId();
+      const recaptchaToken = await getRecaptchaToken("register");
+      try {
+        await fnRegisterDevice({
+          deviceId: devId, recaptchaToken, isRegister: true,
+          extendedFingerprint: collectExtendedFingerprint(), automationSignals: collectAutomationSignals(),
+        });
+      } catch (deviceErr) {
+        showToast("error", "alert-circle", deviceErr.message || "Không thể đăng ký từ thiết bị này!");
+        await cred.user.delete().catch(() => {});
+        await signOut(auth);
+      }
+    } catch (e) {
+      if (e.code === "auth/email-already-in-use") showToast("error", "alert-circle", "Email đã tồn tại!");
+      else showToast("error", "alert-circle", "Đăng ký thất bại!");
+    }
+  };
+
+  window.doLogout = async () => { await signOut(auth); };
+
+  // ── ĐỔI MẬT KHẨU (kích hoạt Withdraw Lock 24h) ──
+  window.submitChangePassword = async () => {
+    const oldPass = document.getElementById("cp-old-pass").value;
+    const newPass = document.getElementById("cp-new-pass").value;
+    if (!oldPass || newPass.length < 6) { showToast("error", "alert-circle", "Nhập đủ mật khẩu (mới tối thiểu 6 ký tự)!"); return; }
+    const btn = document.getElementById("btn-change-password");
+    btn.disabled = true; btn.innerHTML = `<span class="btn-spinner"></span> Đang xử lý...`;
+    try {
+      const cred = EmailAuthProvider.credential(currentUser.email, oldPass);
+      await reauthenticateWithCredential(currentUser, cred);
+      await updatePassword(currentUser, newPass);
+      await fnRecordSecurityChange({ changeType: "password" });
+      showToast("success", "shield-check", "Đổi mật khẩu thành công! Rút tiền sẽ tạm khoá 24h để bảo vệ bạn.");
+      document.getElementById("cp-old-pass").value = "";
+      document.getElementById("cp-new-pass").value = "";
+    } catch (e) {
+      showToast("error", "alert-circle", "Mật khẩu cũ không đúng hoặc có lỗi xảy ra!");
+    } finally {
+      btn.disabled = false; btn.innerHTML = `<i data-lucide="key-round"></i> Đổi mật khẩu`; renderIcons();
+    }
+  };
+
+  // ── NAV ──
+  window.navigateTo = (page) => {
+    document.querySelectorAll(".page").forEach(p => p.classList.remove("active"));
+    document.getElementById("page-" + page).classList.add("active");
+    document.querySelectorAll(".nav-btn").forEach(b => b.classList.remove("active"));
+    document.querySelector(`[data-nav="${page}"]`)?.classList.add("active");
+    if (page === "tasks") loadTasks();
+    if (page === "withdraw") { renderDashboard(); loadPaymentProfile(); }
+    if (page === "account")  loadPaymentProfile();
+  };
+
+  let notifUnsub = null;
+  let cachedNotifications = [];
+
+  function startNotificationListener() {
+    if (notifUnsub) notifUnsub();
+    const q = query(collection(db, "notifications"), orderBy("createdAt", "desc"), limit(30));
+    // Lưu ý: rules chỉ cho đọc notification của chính mình nên Firestore sẽ
+    // tự trả về rỗng/lỗi nếu cố đọc của người khác — nhưng để đúng ngữ nghĩa
+    // và tránh quét thừa, lọc lại phía client theo uid hiện tại.
+    notifUnsub = onSnapshot(q, snap => {
+      const all = [];
+      snap.forEach(d => { const data = d.data(); if (data.uid === currentUser.uid) all.push({ id: d.id, ...data }); });
+      cachedNotifications = all;
+      renderNotifications();
+    }, () => { /* bỏ qua lỗi permission nếu rules chặn, không phá UX */ });
+  }
+  function stopNotificationListener() { if (notifUnsub) { notifUnsub(); notifUnsub = null; } }
+
+  function renderNotifications() {
+    const unreadCount = cachedNotifications.filter(n => !n.isRead).length;
+    const badge = document.getElementById("notif-badge");
+    if (unreadCount > 0) { badge.style.display = "flex"; badge.textContent = unreadCount > 9 ? "9+" : unreadCount; }
+    else { badge.style.display = "none"; }
+
+    const body = document.getElementById("notif-panel-body");
+    if (cachedNotifications.length === 0) {
+      body.innerHTML = `<div class="notif-empty"><i data-lucide="bell-off"></i><span>Chưa có thông báo nào</span></div>`;
+    } else {
+      const typeIcon = { claim_approved: "check-circle-2", claim_rejected: "x-circle", withdraw_approved: "clock",
+                         withdraw_paid: "banknote", withdraw_rejected: "undo-2", account_banned: "shield-x" };
+      body.innerHTML = cachedNotifications.map(n => `
+        <div class="notif-item ${n.isRead ? "" : "unread"}" onclick="markNotificationRead('${n.id}')">
+          <div class="notif-item-icon"><i data-lucide="${typeIcon[n.type] || "bell"}"></i></div>
+          <div class="notif-item-body">
+            <div class="notif-item-title">${escHtml(n.title)}</div>
+            <div class="notif-item-text">${escHtml(n.body)}</div>
+            <div class="notif-item-time">${n.createdAt?.toDate ? n.createdAt.toDate().toLocaleString("vi-VN") : ""}</div>
+          </div>
+        </div>`).join("");
+    }
+    renderIcons();
+  }
+
+  window.toggleNotificationPanel = () => {
+    document.getElementById("notif-panel").classList.toggle("show");
+  };
+  window.markNotificationRead = async (notifId) => {
+    try { await updateDoc(doc(db, "notifications", notifId), { isRead: true, readAt: serverTimestamp() }); } catch (_) {}
+  };
+  window.markAllNotificationsRead = async () => {
+    const unread = cachedNotifications.filter(n => !n.isRead);
+    await Promise.all(unread.map(n => updateDoc(doc(db, "notifications", n.id), { isRead: true, readAt: serverTimestamp() }).catch(() => {})));
+  };
+
+  function showApp() {
+    document.getElementById("auth-screen").style.display = "none";
+    document.getElementById("app-screen").style.display = "block";
+    navigateTo("home");
+    startNotificationListener();
+    renderIcons();
+  }
+  function showAuth() {
+    document.getElementById("auth-screen").style.display = "flex";
+    document.getElementById("app-screen").style.display = "none";
+    stopNotificationListener();
+    renderIcons();
+  }
+
+  function showToast(type, icon, msg) {
+    const container = document.getElementById("toast-container");
+    const el = document.createElement("div");
+    el.className = `toast toast-${type}`;
+    el.innerHTML = `<i data-lucide="${icon}"></i><span>${msg}</span>`;
+    container.appendChild(el);
+    if (window.lucide) lucide.createIcons({ nodes: [el] });
+    requestAnimationFrame(() => el.classList.add("show"));
+    setTimeout(() => { el.classList.remove("show"); setTimeout(() => el.remove(), 300); }, 3500);
+  }
+
+  function renderIcons() { if (window.lucide) lucide.createIcons(); }
+
+  window.toggleAuthMode = () => {
+    const isLogin = document.getElementById("auth-title").textContent.trim() === "Đăng nhập";
+    document.getElementById("auth-title").textContent = isLogin ? "Đăng ký" : "Đăng nhập";
+    document.getElementById("auth-main-btn").innerHTML = isLogin
+      ? `<i data-lucide="user-plus"></i> Đăng ký` : `<i data-lucide="log-in"></i> Đăng nhập`;
+    document.getElementById("auth-main-btn").onclick = isLogin ? window.doRegister : window.doLogin;
+    document.getElementById("auth-toggle-text").textContent = isLogin ? "Đã có tài khoản?" : "Chưa có tài khoản?";
+    document.getElementById("auth-toggle-btn").textContent = isLogin ? "Đăng nhập" : "Đăng ký";
+    renderIcons();
+  };
+
+  window.togglePassVisibility = (inputId, btn) => {
+    const input = document.getElementById(inputId);
+    const show = input.type === "password";
+    input.type = show ? "text" : "password";
+    btn.innerHTML = `<i data-lucide="${show ? "eye-off" : "eye"}"></i>`;
+    renderIcons();
+  };
+
+  document.addEventListener("DOMContentLoaded", renderIcons);
+</script>
+
+<style>
+:root {
+  --bg: #0b0f17; --bg-elevated: #111726; --surface: #161d2e; --surface-2: #1c2438;
+  --border: rgba(255,255,255,0.07); --border-strong: rgba(255,255,255,0.14);
+  --primary: #5b8def; --primary-soft: rgba(91,141,239,0.14);
+  --success: #34d399; --success-soft: rgba(52,211,153,0.14);
+  --danger: #f87171; --danger-soft: rgba(248,113,113,0.14);
+  --warning: #fbbf24; --warning-soft: rgba(251,191,36,0.14);
+  --text: #eef1f8; --text-2: #9aa5bd; --text-3: #626c85;
+  --radius-lg: 20px; --radius-md: 14px; --radius-sm: 10px;
+  --shadow: 0 4px 16px rgba(0,0,0,0.25);
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: var(--bg); color: var(--text); font-family: 'Be Vietnam Pro', sans-serif; min-height: 100vh; -webkit-font-smoothing: antialiased; }
+i[data-lucide] { width: 18px; height: 18px; stroke-width: 2; }
+
+#auth-screen { display: flex; align-items: center; justify-content: center; min-height: 100vh; padding: 24px; background: radial-gradient(circle at 30% 20%, rgba(91,141,239,0.10), transparent 55%), var(--bg); }
+.auth-box { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg); padding: 36px 28px; width: 100%; max-width: 400px; box-shadow: var(--shadow); }
+.auth-logo { text-align: center; margin-bottom: 28px; }
+.auth-logo-icon { width: 56px; height: 56px; border-radius: 16px; background: linear-gradient(135deg, var(--primary), #8b5cf6); display: flex; align-items: center; justify-content: center; margin: 0 auto 14px; box-shadow: 0 8px 20px rgba(91,141,239,0.35); }
+.auth-logo-icon i { width: 28px; height: 28px; color: #fff; }
+.auth-logo h1 { font-size: 24px; font-weight: 800; letter-spacing: -0.5px; }
+.auth-logo p { color: var(--text-2); font-size: 13px; margin-top: 4px; }
+#auth-title { font-size: 19px; font-weight: 700; margin-bottom: 22px; text-align: center; }
+.input-group { margin-bottom: 14px; }
+.input-group label { display: block; font-size: 12px; font-weight: 600; color: var(--text-2); margin-bottom: 6px; }
+.input-wrap { position: relative; }
+.input-wrap i[data-lucide] { position: absolute; left: 14px; top: 50%; transform: translateY(-50%); color: var(--text-3); }
+.input-wrap input { width: 100%; background: var(--bg-elevated); border: 1.5px solid var(--border); border-radius: var(--radius-sm); padding: 13px 14px 13px 42px; color: var(--text); font-family: inherit; font-size: 15px; outline: none; transition: border-color .2s, box-shadow .2s; }
+.input-wrap input:focus { border-color: var(--primary); box-shadow: 0 0 0 3px var(--primary-soft); }
+.input-wrap .pass-toggle { position: absolute; right: 10px; top: 50%; transform: translateY(-50%); background: none; border: none; color: var(--text-3); cursor: pointer; padding: 6px; border-radius: 8px; display: flex; }
+.input-wrap .pass-toggle:hover { background: var(--surface-2); color: var(--text); }
+.btn-primary { width: 100%; padding: 14px; background: var(--primary); border: none; border-radius: var(--radius-sm); color: #fff; font-family: inherit; font-weight: 700; font-size: 15px; cursor: pointer; margin-top: 6px; display: flex; align-items: center; justify-content: center; gap: 8px; transition: transform .15s, box-shadow .2s; box-shadow: 0 6px 16px rgba(91,141,239,0.3); }
+.btn-primary:hover { background: #4b7de0; }
+.btn-primary:active { transform: translateY(0); }
+.auth-toggle { text-align: center; margin-top: 18px; font-size: 13px; color: var(--text-2); }
+.auth-toggle button { background: none; border: none; color: var(--primary); cursor: pointer; font-family: inherit; font-size: 13px; font-weight: 700; margin-left: 4px; }
+
+#app-screen { display: none; }
+.app-header { background: var(--bg-elevated); border-bottom: 1px solid var(--border); padding: 14px 20px; display: flex; align-items: center; justify-content: space-between; position: sticky; top: 0; z-index: 100; backdrop-filter: blur(14px); }
+.header-logo { display: flex; align-items: center; gap: 8px; font-weight: 800; font-size: 17px; }
+.header-logo-icon { width: 30px; height: 30px; border-radius: 9px; background: linear-gradient(135deg, var(--primary), #8b5cf6); display: flex; align-items: center; justify-content: center; }
+.header-logo-icon i { width: 16px; height: 16px; color: #fff; }
+.header-right { display: flex; align-items: center; gap: 10px; }
+#user-email { font-size: 11px; color: var(--text-2); max-width: 130px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.btn-icon { position: relative; background: var(--surface-2); border: none; color: var(--text-2); width: 34px; height: 34px; border-radius: var(--radius-sm); cursor: pointer; display: flex; align-items: center; justify-content: center; }
+.notif-badge { position: absolute; top: -4px; right: -4px; background: var(--danger); color: #fff; font-size: 9px; font-weight: 800; min-width: 16px; height: 16px; border-radius: 8px; display: flex; align-items: center; justify-content: center; padding: 0 3px; }
+.notif-panel { position: fixed; top: 60px; right: 12px; width: min(90vw, 340px); max-height: 70vh; background: var(--surface); border: 1px solid var(--border-strong); border-radius: var(--radius-md); box-shadow: var(--shadow); z-index: 200; display: none; flex-direction: column; overflow: hidden; }
+.notif-panel.show { display: flex; }
+.notif-panel-header { display: flex; justify-content: space-between; align-items: center; padding: 12px 14px; border-bottom: 1px solid var(--border); font-size: 13px; font-weight: 700; }
+.link-btn-sm { background: none; border: none; color: var(--primary); font-family: inherit; font-size: 11px; font-weight: 600; cursor: pointer; }
+.notif-panel-body { overflow-y: auto; }
+.notif-item { display: flex; gap: 10px; padding: 12px 14px; border-bottom: 1px solid var(--border); cursor: pointer; }
+.notif-item:last-child { border-bottom: none; }
+.notif-item.unread { background: rgba(91,141,239,0.05); }
+.notif-item-icon { width: 32px; height: 32px; border-radius: 9px; background: var(--surface-2); color: var(--text-2); display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+.notif-item-title { font-size: 12.5px; font-weight: 700; }
+.notif-item-text { font-size: 11.5px; color: var(--text-2); margin-top: 2px; line-height: 1.4; }
+.notif-item-time { font-size: 10px; color: var(--text-3); margin-top: 4px; }
+.notif-empty { display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 40px 20px; color: var(--text-3); font-size: 12px; }
+.btn-logout:hover { background: rgba(248,113,113,0.24); }
+
+.bottom-nav { position: fixed; bottom: 0; left: 0; right: 0; background: var(--bg-elevated); border-top: 1px solid var(--border); display: flex; z-index: 100; backdrop-filter: blur(14px); padding-bottom: env(safe-area-inset-bottom); }
+.nav-btn { flex: 1; padding: 12px 8px 10px; background: none; border: none; color: var(--text-3); display: flex; flex-direction: column; align-items: center; gap: 4px; cursor: pointer; font-family: inherit; font-size: 11px; font-weight: 600; transition: color .2s; }
+.nav-btn i { width: 22px; height: 22px; transition: transform .2s; }
+.nav-btn.active { color: var(--primary); }
+.nav-btn.active i { transform: translateY(-2px); }
+
+.page { display: none; padding: 20px 20px 96px; }
+.page.active { display: block; }
+
+.welcome-banner { background: linear-gradient(135deg, #1a2440, #14192b); border: 1px solid var(--border); border-radius: var(--radius-lg); padding: 26px 22px; margin-bottom: 18px; position: relative; overflow: hidden; }
+.welcome-banner::after { content: ''; position: absolute; right: -30px; top: -30px; width: 140px; height: 140px; border-radius: 50%; background: radial-gradient(circle, rgba(91,141,239,0.25), transparent 70%); }
+.welcome-greeting { font-size: 14px; color: var(--text-2); margin-bottom: 2px; }
+.welcome-greeting b { color: var(--text); }
+.welcome-label { font-size: 12px; color: var(--text-2); margin-top: 12px; margin-bottom: 6px; }
+.welcome-balance { font-size: 34px; font-weight: 800; letter-spacing: -1px; }
+.welcome-actions { display: flex; gap: 10px; margin-top: 18px; }
+.welcome-actions .pill-btn { flex: 1; }
+
+.pill-btn { display: flex; align-items: center; justify-content: center; gap: 8px; padding: 12px; background: var(--surface-2); border: 1px solid var(--border-strong); border-radius: var(--radius-sm); color: var(--text); font-family: inherit; font-weight: 700; font-size: 13px; cursor: pointer; transition: transform .15s, background .2s; }
+.pill-btn:hover { background: #232c45; }
+.pill-btn.primary { background: var(--primary); border-color: transparent; box-shadow: 0 6px 16px rgba(91,141,239,0.3); }
+.pill-btn.primary:hover { background: #4b7de0; }
+
+.stats-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 18px; }
+.stat-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-md); padding: 16px; display: flex; align-items: center; gap: 12px; }
+.stat-icon { width: 40px; height: 40px; border-radius: 12px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+.stat-icon.green { background: var(--success-soft); color: var(--success); }
+.stat-icon.orange { background: var(--warning-soft); color: var(--warning); }
+.stat-label { font-size: 11px; color: var(--text-2); }
+.stat-value { font-size: 16px; font-weight: 700; margin-top: 2px; }
+
+.section-title { font-size: 13px; font-weight: 700; color: var(--text-2); margin: 4px 0 12px; text-transform: uppercase; letter-spacing: .4px; }
+.how-section { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-md); padding: 18px; margin-top: 20px; }
+.how-step { display: flex; gap: 14px; align-items: flex-start; margin-bottom: 16px; }
+.how-step:last-child { margin-bottom: 0; }
+.how-num { width: 32px; height: 32px; background: var(--primary-soft); color: var(--primary); border-radius: 10px; display: flex; align-items: center; justify-content: center; font-weight: 800; font-size: 13px; flex-shrink: 0; }
+.how-text strong { display: block; font-size: 14px; margin-bottom: 2px; }
+.how-text span { color: var(--text-2); font-size: 12.5px; }
+
+.page-title { font-size: 20px; font-weight: 800; margin-bottom: 4px; }
+.page-sub { font-size: 12.5px; color: var(--text-2); margin-bottom: 20px; }
+
+.task-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-md); padding: 16px; margin-bottom: 12px; display: flex; gap: 14px; transition: border-color .15s; }
+.task-card:hover:not(.done) { border-color: var(--border-strong); }
+.task-icon-wrap { width: 44px; height: 44px; border-radius: 12px; background: var(--primary-soft); color: var(--primary); display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+.task-card.done .task-icon-wrap { background: var(--success-soft); color: var(--success); }
+.task-body { flex: 1; min-width: 0; }
+.task-header { display: flex; justify-content: space-between; gap: 10px; margin-bottom: 4px; }
+.task-title { font-weight: 700; font-size: 14.5px; }
+.task-reward { font-weight: 800; font-size: 13px; color: var(--success); white-space: nowrap; }
+.task-desc { font-size: 12.5px; color: var(--text-2); margin-bottom: 12px; line-height: 1.5; }
+.btn-task { display: flex; align-items: center; gap: 6px; padding: 10px 14px; background: var(--primary-soft); border: none; border-radius: var(--radius-sm); color: var(--primary); font-family: inherit; font-weight: 700; font-size: 12.5px; cursor: pointer; transition: all .2s; }
+.btn-task:hover:not(:disabled) { background: rgba(91,141,239,0.25); }
+.btn-task:disabled { opacity: .6; cursor: not-allowed; }
+.done-btn { background: var(--success-soft); color: var(--success); }
+.btn-task i { width: 15px; height: 15px; }
+
+.skeleton-card { display: flex; flex-direction: column; gap: 8px; }
+.skel { background: linear-gradient(90deg, var(--surface-2) 25%, #26304a 37%, var(--surface-2) 63%); background-size: 400% 100%; animation: shimmer 1.4s ease infinite; border-radius: 8px; }
+.skel-title { height: 16px; width: 60%; }
+.skel-desc { height: 12px; width: 90%; }
+.skel-btn { height: 34px; width: 130px; margin-top: 4px; }
+
+.empty-state { text-align: center; padding: 60px 20px; }
+.empty-icon { width: 64px; height: 64px; border-radius: 18px; background: var(--surface-2); color: var(--text-3); display: flex; align-items: center; justify-content: center; margin: 0 auto 16px; }
+.empty-icon i { width: 30px; height: 30px; }
+.empty-title { font-size: 15px; font-weight: 700; margin-bottom: 6px; }
+.empty-sub { font-size: 12.5px; color: var(--text-2); max-width: 240px; margin: 0 auto; line-height: 1.5; }
+
+.withdraw-balance-box { background: linear-gradient(135deg, #16241c, #0f1c15); border: 1px solid rgba(52,211,153,0.25); border-radius: var(--radius-lg); padding: 22px; margin-bottom: 18px; text-align: center; }
+.withdraw-balance-label { font-size: 12px; color: var(--text-2); margin-bottom: 6px; }
+.withdraw-balance-val { font-size: 28px; font-weight: 800; color: var(--success); }
+.withdraw-form { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-md); padding: 18px; }
+.withdraw-note { display: flex; gap: 10px; background: var(--warning-soft); border: 1px solid rgba(251,191,36,0.25); border-radius: var(--radius-sm); padding: 12px 14px; font-size: 12px; color: #fcd34d; margin-bottom: 16px; line-height: 1.6; }
+.withdraw-note i { flex-shrink: 0; width: 16px; height: 16px; margin-top: 1px; }
+
+.settings-list { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-md); overflow: hidden; margin-bottom: 16px; }
+.settings-item { display: flex; align-items: center; gap: 12px; padding: 14px 16px; border-bottom: 1px solid var(--border); }
+.settings-item:last-child { border-bottom: none; }
+.settings-item-icon { width: 36px; height: 36px; border-radius: 10px; background: var(--surface-2); color: var(--text-2); display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+.settings-item-body { flex: 1; }
+.settings-item-title { font-size: 13.5px; font-weight: 600; }
+.settings-item-sub { font-size: 11.5px; color: var(--text-2); margin-top: 1px; }
+.settings-item-clickable { cursor: pointer; text-decoration: none; color: inherit; transition: background .15s; }
+.settings-item-clickable:hover { background: var(--surface-2); }
+.settings-item-clickable > i[data-lucide="chevron-right"] { color: var(--text-3); flex-shrink: 0; }
+
+.profile-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-md); padding: 6px; margin-bottom: 16px; }
+.profile-card.empty { display: flex; align-items: center; gap: 10px; padding: 16px; color: var(--warning); font-size: 13px; font-weight: 600; background: var(--warning-soft); border-color: rgba(251,191,36,0.25); }
+.profile-row { display: flex; align-items: center; gap: 12px; padding: 10px 12px; }
+.profile-row i { color: var(--text-3); width: 18px; height: 18px; flex-shrink: 0; }
+.profile-row-label { font-size: 10.5px; color: var(--text-2); }
+.profile-row-val { font-size: 13.5px; font-weight: 600; margin-top: 1px; }
+.link-btn { display: block; width: 100%; text-align: center; padding: 10px; background: none; border: none; border-top: 1px solid var(--border); color: var(--primary); font-family: inherit; font-weight: 700; font-size: 12.5px; cursor: pointer; margin-top: 4px; }
+
+.back-btn { background: var(--surface-2); border: none; width: 32px; height: 32px; border-radius: 10px; color: var(--text); display: inline-flex; align-items: center; justify-content: center; cursor: pointer; margin-right: 8px; vertical-align: middle; }
+
+.faq-list { margin-bottom: 20px; }
+.faq-item { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-md); padding: 14px 16px; margin-bottom: 10px; }
+.faq-item summary { cursor: pointer; font-weight: 600; font-size: 13.5px; list-style: none; display: flex; justify-content: space-between; align-items: center; }
+.faq-item summary::after { content: '+'; color: var(--text-2); font-size: 18px; }
+.faq-item[open] summary::after { content: '−'; }
+.faq-item p { color: var(--text-2); font-size: 12.5px; margin-top: 10px; line-height: 1.6; }
+
+.terms-box { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-md); padding: 20px; }
+.terms-box h3 { font-size: 14px; margin-bottom: 6px; margin-top: 18px; }
+.terms-box h3:first-child { margin-top: 0; }
+.terms-box p { font-size: 12.5px; color: var(--text-2); line-height: 1.7; }
+
+#modal-overlay { display: flex; position: fixed; inset: 0; background: rgba(6,9,16,0.72); backdrop-filter: blur(6px); z-index: 999; align-items: center; justify-content: center; padding: 20px; opacity: 0; pointer-events: none; transition: opacity .25s; }
+#modal-overlay.show { opacity: 1; pointer-events: auto; }
+.modal-box { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg); padding: 32px 26px; max-width: 340px; width: 100%; text-align: center; transform: scale(.92) translateY(10px); transition: transform .25s; box-shadow: var(--shadow); }
+#modal-overlay.show .modal-box { transform: scale(1) translateY(0); }
+.modal-icon-wrap { width: 60px; height: 60px; border-radius: 18px; background: var(--success-soft); color: var(--success); display: flex; align-items: center; justify-content: center; margin: 0 auto 16px; }
+.modal-icon-wrap i { width: 30px; height: 30px; }
+.modal-title { font-size: 15px; font-weight: 700; margin-bottom: 8px; }
+.modal-reward-val { font-size: 30px; font-weight: 800; color: var(--success); margin: 14px 0; }
+.modal-desc { font-size: 12.5px; color: var(--text-2); margin-bottom: 24px; line-height: 1.5; }
+.modal-btns { display: flex; gap: 10px; }
+.btn-confirm { flex: 1; padding: 13px; background: var(--success); border: none; border-radius: var(--radius-sm); color: #06281c; font-family: inherit; font-weight: 700; font-size: 13px; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 6px; }
+.btn-cancel { flex: 1; padding: 13px; background: var(--surface-2); border: none; border-radius: var(--radius-sm); color: var(--text-2); font-family: inherit; font-weight: 700; font-size: 13px; cursor: pointer; }
+
+#toast-container { position: fixed; top: 16px; left: 50%; transform: translateX(-50%); z-index: 9999; display: flex; flex-direction: column; gap: 8px; width: min(90vw, 380px); }
+.toast { display: flex; align-items: center; gap: 10px; background: var(--surface); border: 1px solid var(--border-strong); border-radius: var(--radius-sm); padding: 13px 16px; font-size: 13px; font-weight: 600; box-shadow: var(--shadow); opacity: 0; transform: translateY(-14px); transition: all .3s cubic-bezier(.34,1.56,.64,1); }
+.toast.show { opacity: 1; transform: translateY(0); }
+.toast i { flex-shrink: 0; width: 18px; height: 18px; }
+.toast-success { border-color: rgba(52,211,153,0.35); } .toast-success i { color: var(--success); }
+.toast-error { border-color: rgba(248,113,113,0.35); } .toast-error i { color: var(--danger); }
+.toast-info { border-color: rgba(91,141,239,0.35); } .toast-info i { color: var(--primary); }
+
+.btn-spinner { width: 15px; height: 15px; border: 2px solid rgba(255,255,255,0.35); border-top-color: #fff; border-radius: 50%; display: inline-block; animation: spin .7s linear infinite; }
+
+@keyframes fadeUp { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+@keyframes spin { to { transform: rotate(360deg); } }
+@keyframes shimmer { 0% { background-position: 100% 0; } 100% { background-position: 0 0; } }
+</style>
+</head>
+<body>
+
+<div id="auth-screen">
+  <div class="auth-box">
+    <div class="auth-logo">
+      <div class="auth-logo-icon"><i data-lucide="wallet"></i></div>
+      <h1>TaskEarn</h1>
+      <p>Kiếm tiền thật · Rút về tài khoản thật</p>
+    </div>
+    <div id="auth-title">Đăng nhập</div>
+    <div class="input-group">
+      <label>Email</label>
+      <div class="input-wrap"><i data-lucide="mail"></i><input type="email" id="auth-email" placeholder="email@example.com"></div>
+    </div>
+    <div class="input-group">
+      <label>Mật khẩu</label>
+      <div class="input-wrap">
+        <i data-lucide="lock"></i>
+        <input type="password" id="auth-pass" placeholder="••••••••">
+        <button class="pass-toggle" onclick="togglePassVisibility('auth-pass', this)"><i data-lucide="eye"></i></button>
+      </div>
+    </div>
+    <button class="btn-primary" id="auth-main-btn" onclick="doLogin()"><i data-lucide="log-in"></i> Đăng nhập</button>
+    <div class="auth-toggle">
+      <span id="auth-toggle-text">Chưa có tài khoản?</span>
+      <button id="auth-toggle-btn" onclick="toggleAuthMode()">Đăng ký</button>
+    </div>
+  </div>
+</div>
+
+<div id="app-screen">
+  <header class="app-header">
+    <div class="header-logo"><div class="header-logo-icon"><i data-lucide="wallet"></i></div>TaskEarn</div>
+    <div class="header-right">
+      <span id="user-email"></span>
+      <button class="btn-icon" onclick="toggleNotificationPanel()"><i data-lucide="bell"></i><span class="notif-badge" id="notif-badge" style="display:none">0</span></button>
+      <button class="btn-logout" onclick="doLogout()"><i data-lucide="log-out"></i></button>
+    </div>
+  </header>
+
+  <div class="notif-panel" id="notif-panel">
+    <div class="notif-panel-header">
+      <span>Thông báo</span>
+      <button class="link-btn-sm" onclick="markAllNotificationsRead()">Đánh dấu đã đọc hết</button>
+    </div>
+    <div class="notif-panel-body" id="notif-panel-body"></div>
+  </div>
+
+  <div class="page active" id="page-home">
+    <div class="welcome-banner">
+      <div class="welcome-greeting">Xin chào, <b id="user-greeting-name">bạn</b> 👋</div>
+      <div class="welcome-label">Số dư hiện tại</div>
+      <div class="welcome-balance" id="balance-display-home">0đ</div>
+      <div class="welcome-actions">
+        <button class="pill-btn primary" onclick="navigateTo('tasks')"><i data-lucide="zap"></i> Nhiệm vụ</button>
+        <button class="pill-btn" onclick="navigateTo('withdraw')"><i data-lucide="banknote"></i> Rút tiền</button>
+      </div>
+    </div>
+    <div class="stats-grid">
+      <div class="stat-card"><div class="stat-icon green"><i data-lucide="trending-up"></i></div><div><div class="stat-label">Hôm nay</div><div class="stat-value" id="today-display">0đ</div></div></div>
+      <div class="stat-card"><div class="stat-icon orange"><i data-lucide="coins"></i></div><div><div class="stat-label">Tổng cộng</div><div class="stat-value" id="total-display">0đ</div></div></div>
+    </div>
+    <div class="how-section">
+      <div class="section-title">Cách hoạt động</div>
+      <div class="how-step"><div class="how-num">1</div><div class="how-text"><strong>Chọn nhiệm vụ</strong><span>Vào tab Nhiệm vụ, chọn link muốn làm</span></div></div>
+      <div class="how-step"><div class="how-num">2</div><div class="how-text"><strong>Vượt link</strong><span>Bấm nhận nhiệm vụ, hoàn thành vượt link</span></div></div>
+      <div class="how-step"><div class="how-num">3</div><div class="how-text"><strong>Nhận tiền</strong><span>Tiền tự động vào số dư, rút khi đủ 100k</span></div></div>
+    </div>
+  </div>
+
+  <div class="page" id="page-tasks">
+    <div class="page-title">Nhiệm vụ</div>
+    <div class="page-sub">Mỗi nhiệm vụ làm được 1 lần/ngày · Tự động mở lại vào 0h hôm sau</div>
+    <div id="tasks-container"></div>
+  </div>
+
+  <div class="page" id="page-withdraw">
+    <div class="page-title">Rút tiền</div>
+    <div class="page-sub">Tối thiểu 100.000đ · Nhận trong 12 ngày</div>
+    <div class="withdraw-balance-box">
+      <div class="withdraw-balance-label">Số dư khả dụng</div>
+      <div class="withdraw-balance-val" id="balance-display-withdraw">0đ</div>
+    </div>
+    <div class="withdraw-note"><i data-lucide="info"></i> Tiền sẽ được chuyển vào tài khoản ngân hàng trong vòng 12 ngày làm việc kể từ khi gửi lệnh rút.</div>
+    <div class="section-title">Hồ sơ thanh toán</div>
+    <div id="withdraw-profile-box"></div>
+    <div class="withdraw-form">
+      <div class="input-group"><label>Số tiền rút (VND)</label><div class="input-wrap"><i data-lucide="banknote"></i><input type="number" id="withdraw-amount" placeholder="100000" min="100000" step="1000"></div></div>
+      <button class="btn-primary" id="btn-submit-withdraw" onclick="submitWithdraw()"><i data-lucide="send"></i> Gửi lệnh rút tiền</button>
+    </div>
+  </div>
+
+  <div class="page" id="page-account">
+    <div class="page-title">Tài khoản</div>
+    <div class="page-sub">Quản lý thông tin và bảo mật</div>
+    <div class="settings-list">
+      <div class="settings-item">
+        <div class="settings-item-icon"><i data-lucide="mail"></i></div>
+        <div class="settings-item-body"><div class="settings-item-title" id="account-email-display">-</div><div class="settings-item-sub">Email đăng nhập</div></div>
+      </div>
+    </div>
+
+    <div class="section-title">Hồ sơ thanh toán</div>
+    <div id="account-profile-box"></div>
+    <div class="withdraw-form">
+      <div class="input-group"><label>Ngân hàng</label><div class="input-wrap"><i data-lucide="landmark"></i><input type="text" id="pp-bank-name" placeholder="VD: Vietcombank, MB Bank..."></div></div>
+      <div class="input-group"><label>Số tài khoản</label><div class="input-wrap"><i data-lucide="credit-card"></i><input type="text" id="pp-bank-account" placeholder="Số tài khoản ngân hàng"></div></div>
+      <div class="input-group"><label>Tên chủ tài khoản</label><div class="input-wrap"><i data-lucide="user"></i><input type="text" id="pp-bank-holder" placeholder="Họ tên đúng như ngân hàng"></div></div>
+      <div class="input-group"><label>Chi nhánh (không bắt buộc)</label><div class="input-wrap"><i data-lucide="map-pin"></i><input type="text" id="pp-branch" placeholder="VD: Chi nhánh Quận 1"></div></div>
+      <div class="withdraw-note"><i data-lucide="shield-alert"></i> Nếu bạn đổi hồ sơ thanh toán, rút tiền sẽ tạm khoá 24 giờ để bảo vệ tài khoản.</div>
+      <button class="btn-primary" id="btn-save-profile" onclick="submitPaymentProfile()"><i data-lucide="save"></i> Lưu hồ sơ thanh toán</button>
+    </div>
+
+    <div class="section-title">Đổi mật khẩu</div>
+    <div class="withdraw-form">
+      <div class="input-group"><label>Mật khẩu hiện tại</label><div class="input-wrap"><i data-lucide="lock"></i><input type="password" id="cp-old-pass" placeholder="Mật khẩu hiện tại"></div></div>
+      <div class="input-group"><label>Mật khẩu mới</label><div class="input-wrap"><i data-lucide="key-round"></i><input type="password" id="cp-new-pass" placeholder="Tối thiểu 6 ký tự"></div></div>
+      <div class="withdraw-note"><i data-lucide="shield-alert"></i> Vì lý do bảo mật, chức năng rút tiền sẽ tạm khoá 24 giờ sau khi đổi mật khẩu.</div>
+      <button class="btn-primary" id="btn-change-password" onclick="submitChangePassword()"><i data-lucide="key-round"></i> Đổi mật khẩu</button>
+    </div>
+
+    <div class="section-title">Khác</div>
+    <div class="settings-list">
+      <div class="settings-item settings-item-clickable" onclick="navigateTo('support')">
+        <div class="settings-item-icon"><i data-lucide="life-buoy"></i></div>
+        <div class="settings-item-body"><div class="settings-item-title">Hỗ trợ &amp; Câu hỏi thường gặp</div><div class="settings-item-sub">Liên hệ khi cần trợ giúp</div></div>
+        <i data-lucide="chevron-right"></i>
+      </div>
+      <div class="settings-item settings-item-clickable" onclick="navigateTo('terms')">
+        <div class="settings-item-icon"><i data-lucide="file-text"></i></div>
+        <div class="settings-item-body"><div class="settings-item-title">Điều khoản &amp; Chính sách</div><div class="settings-item-sub">Quy định sử dụng, rút tiền, chống gian lận</div></div>
+        <i data-lucide="chevron-right"></i>
+      </div>
+    </div>
+  </div>
+
+  <div class="page" id="page-support">
+    <div class="page-title"><button class="back-btn" onclick="navigateTo('account')"><i data-lucide="arrow-left"></i></button> Hỗ trợ</div>
+    <div class="page-sub">Câu hỏi thường gặp và kênh liên hệ</div>
+    <div class="faq-list">
+      <details class="faq-item"><summary>Khi nào tôi nhận được tiền sau khi rút?</summary><p>Trong vòng 12 ngày làm việc kể từ khi lệnh rút được admin duyệt.</p></details>
+      <details class="faq-item"><summary>Vì sao rút tiền bị tạm khoá?</summary><p>Sau khi đổi mật khẩu hoặc hồ sơ thanh toán, hệ thống tự khoá rút tiền 24 giờ để bảo vệ bạn khỏi bị chiếm tài khoản.</p></details>
+      <details class="faq-item"><summary>Vì sao nhiệm vụ không hiện lại dù đã qua ngày mới?</summary><p>Nhiệm vụ reset lúc 0h00 giờ Việt Nam. Nếu vẫn chưa thấy, thử tải lại trang.</p></details>
+      <details class="faq-item"><summary>Claim của tôi bị từ chối, vì sao?</summary><p>Có thể do hoàn thành quá nhanh, dùng lại phiên cũ, hoặc hệ thống phát hiện dấu hiệu bất thường. Vui lòng làm lại nhiệm vụ đúng cách.</p></details>
+    </div>
+    <div class="section-title">Kênh liên hệ</div>
+    <div class="settings-list">
+      <a class="settings-item settings-item-clickable" href="#" target="_blank"><div class="settings-item-icon"><i data-lucide="send"></i></div><div class="settings-item-body"><div class="settings-item-title">Telegram</div></div></a>
+      <a class="settings-item settings-item-clickable" href="#" target="_blank"><div class="settings-item-icon"><i data-lucide="message-circle"></i></div><div class="settings-item-body"><div class="settings-item-title">Facebook</div></div></a>
+      <a class="settings-item settings-item-clickable" href="mailto:support@example.com"><div class="settings-item-icon"><i data-lucide="mail"></i></div><div class="settings-item-body"><div class="settings-item-title">Email hỗ trợ</div></div></a>
+    </div>
+  </div>
+
+  <div class="page" id="page-terms">
+    <div class="page-title"><button class="back-btn" onclick="navigateTo('account')"><i data-lucide="arrow-left"></i></button> Điều khoản &amp; Chính sách</div>
+    <div class="terms-box">
+      <h3>Điều khoản sử dụng</h3>
+      <p>Bằng việc sử dụng TaskEarn, bạn đồng ý chỉ tạo và sử dụng 1 tài khoản, không dùng công cụ tự động, không gian lận dưới bất kỳ hình thức nào.</p>
+      <h3>Quy định rút tiền</h3>
+      <p>Số tiền rút tối thiểu 100.000đ. Thời gian xử lý tối đa 12 ngày làm việc. Rút tiền có thể tạm khoá 24h sau khi thay đổi thông tin bảo mật.</p>
+      <h3>Chính sách chống gian lận</h3>
+      <p>Hệ thống sử dụng nhiều lớp bảo vệ để phát hiện gian lận. Tài khoản vi phạm có thể bị khoá tạm thời hoặc vĩnh viễn, tuỳ mức độ.</p>
+    </div>
+  </div>
+
+  <nav class="bottom-nav">
+    <button class="nav-btn active" data-nav="home" onclick="navigateTo('home')"><i data-lucide="home"></i>Trang chủ</button>
+    <button class="nav-btn" data-nav="tasks" onclick="navigateTo('tasks')"><i data-lucide="zap"></i>Nhiệm vụ</button>
+    <button class="nav-btn" data-nav="withdraw" onclick="navigateTo('withdraw')"><i data-lucide="banknote"></i>Rút tiền</button>
+    <button class="nav-btn" data-nav="account" onclick="navigateTo('account')"><i data-lucide="user-circle"></i>Tài khoản</button>
+  </nav>
+</div>
+
+<div id="modal-overlay">
+  <div class="modal-box">
+    <div class="modal-icon-wrap"><i data-lucide="check"></i></div>
+    <div class="modal-title">Hoàn thành nhiệm vụ?</div>
+    <div class="modal-reward-val" id="modal-reward">+400đ</div>
+    <div class="modal-desc">Xác nhận bạn đã vượt link thành công để nhận thưởng.</div>
+    <div class="modal-btns">
+      <button class="btn-confirm" id="btn-claim-confirm" onclick="claimReward()"><i data-lucide="check"></i> Xác nhận</button>
+      <button class="btn-cancel" onclick="closeModal()">Hủy</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast-container"></div>
+</body>
+</html>

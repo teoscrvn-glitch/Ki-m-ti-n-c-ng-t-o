@@ -1,0 +1,1167 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TaskEarn Admin</title>
+<link href="https://fonts.googleapis.com/css2?family=Be+Vietnam+Pro:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<script src="https://unpkg.com/lucide@latest/dist/umd/lucide.js"></script>
+
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+import { getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged }
+                          from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+import { getFirestore, doc, addDoc, updateDoc, deleteDoc, collection, getDocs, query,
+         where, orderBy, limit, startAfter, onSnapshot, serverTimestamp, getCountFromServer }
+                          from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+import { getFunctions, httpsCallable } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-functions.js";
+
+// ================================================================
+// THAY FIREBASE CONFIG (giống index.html)
+// ================================================================
+const firebaseConfig = {
+  apiKey: "THAY_API_KEY", authDomain: "THAY_AUTH_DOMAIN", projectId: "THAY_PROJECT_ID",
+  storageBucket: "THAY_STORAGE_BUCKET", messagingSenderId: "THAY_SENDER_ID", appId: "THAY_APP_ID"
+};
+// ================================================================
+
+const app       = initializeApp(firebaseConfig);
+const auth      = getAuth(app);
+const db        = getFirestore(app);
+const functions = getFunctions(app, "asia-southeast1");
+
+const fnApproveClaim         = httpsCallable(functions, "approveClaim");
+const fnRejectClaim          = httpsCallable(functions, "rejectClaim");
+const fnApproveWithdraw      = httpsCallable(functions, "approveWithdraw");
+const fnMarkWithdrawPaid     = httpsCallable(functions, "markWithdrawPaid");
+const fnMarkWithdrawCompleted= httpsCallable(functions, "markWithdrawCompleted");
+const fnRejectWithdraw       = httpsCallable(functions, "rejectWithdraw");
+const fnSetAdminClaim        = httpsCallable(functions, "setAdminClaim");
+const fnFraudDashboard       = httpsCallable(functions, "getFraudDashboard");
+const fnDashboardStats       = httpsCallable(functions, "getDashboardStats");
+const fnTopStats             = httpsCallable(functions, "getTopStats");
+const fnSetRole              = httpsCallable(functions, "setRole");
+const fnUidTimeline          = httpsCallable(functions, "getUidTimeline");
+const fnBanDevice            = httpsCallable(functions, "banDevice");
+const fnBanUID               = httpsCallable(functions, "banUID");
+const fnBanIP                = httpsCallable(functions, "banIP");
+
+let currentAdmin = null;
+let currentUserRole = null;
+
+const CLIENT_ROLE_PERMISSIONS = {
+  super_admin: ["approve_claim","reject_claim","approve_withdraw","mark_paid","mark_completed","reject_withdraw","manage_tasks","ban_uid","ban_device","ban_ip","set_role","view_fraud","view_audit","export_data"],
+  admin:       ["approve_claim","reject_claim","approve_withdraw","mark_paid","mark_completed","reject_withdraw","manage_tasks","ban_uid","ban_device","ban_ip","view_fraud","view_audit","export_data"],
+  finance:     ["approve_withdraw","mark_paid","mark_completed","reject_withdraw","view_audit","export_data"],
+  moderator:   ["ban_uid","ban_device","ban_ip","view_fraud","view_audit"],
+  support:     ["view_audit"],
+  viewer:      [],
+};
+function can(permission) {
+  if (!currentUserRole) return true; // token cũ chưa có role -> coi như admin đầy đủ (tương thích ngược)
+  return (CLIENT_ROLE_PERMISSIONS[currentUserRole] || []).includes(permission);
+}
+let unsubListeners = [];
+
+// ─────────────────────────────────────────────
+// AUTH
+// ─────────────────────────────────────────────
+onAuthStateChanged(auth, async (user) => {
+  if (!user) { showLoginScreen(); return; }
+  const token = await user.getIdTokenResult(true);
+  if (token.claims.admin === true) {
+    currentAdmin = user;
+    currentUserRole = token.claims.role || "admin"; // token cũ chưa có role -> mặc định admin
+    setText("admin-email-display", `${user.email} · ${roleLabel(currentUserRole)}`);
+    showAdminPanel();
+    applyRoleUI();
+    loadDashboard();
+  } else {
+    await signOut(auth);
+    showToast("error", "shield-x", "Tài khoản không có quyền admin!");
+    showLoginScreen();
+  }
+});
+
+function roleLabel(role) {
+  return { super_admin: "Super Admin", admin: "Admin", finance: "Finance", moderator: "Moderator", support: "Support", viewer: "Viewer" }[role] || role;
+}
+
+/** Ẩn các tab mà role hiện tại không có quyền vào — tránh nhầm lẫn UX,
+ * dù backend vẫn luôn tự chặn qua assertPermission() cho dù client có ẩn hay không. */
+function applyRoleUI() {
+  document.getElementById("tab-tasks").style.display    = can("manage_tasks") ? "" : "none";
+  document.getElementById("tab-fraud").style.display    = can("view_fraud")   ? "" : "none";
+  document.getElementById("tab-audit").style.display    = can("view_audit")  ? "" : "none";
+  document.getElementById("card-set-role")?.style && (document.getElementById("card-set-role").style.display = can("set_role") ? "" : "none");
+  document.getElementById("card-ban-uid")?.style    && (document.getElementById("card-ban-uid").style.display    = can("ban_uid")    ? "" : "none");
+  document.getElementById("card-ban-device")?.style && (document.getElementById("card-ban-device").style.display = can("ban_device") ? "" : "none");
+  document.getElementById("card-ban-ip")?.style     && (document.getElementById("card-ban-ip").style.display     = can("ban_ip")     ? "" : "none");
+  document.querySelectorAll(".export-btn").forEach(b => { if (!can("export_data")) b.style.display = "none"; });
+}
+
+function showLoginScreen() {
+  document.getElementById("login-screen").style.display = "flex";
+  document.getElementById("admin-panel").style.display  = "none";
+  clearListeners();
+}
+function showAdminPanel() {
+  document.getElementById("login-screen").style.display = "none";
+  document.getElementById("admin-panel").style.display  = "block";
+  renderIcons();
+}
+function clearListeners() { unsubListeners.forEach(u => u()); unsubListeners = []; }
+
+window.doAdminLogin = async () => {
+  const email = document.getElementById("login-email").value.trim();
+  const pass  = document.getElementById("login-pass").value;
+  if (!email || !pass) { showToast("error", "alert-circle", "Nhập đầy đủ!"); return; }
+  try { await signInWithEmailAndPassword(auth, email, pass); }
+  catch (e) { showToast("error", "alert-circle", "Sai email hoặc mật khẩu!"); }
+};
+window.doAdminLogout = async () => { clearListeners(); await signOut(auth); };
+
+// ─────────────────────────────────────────────
+// DASHBOARD
+// ─────────────────────────────────────────────
+async function loadDashboard() {
+  switchTab("dashboard");
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+
+  const [totalUsersSnap, pendingClaimsSnap, pendingWdSnap, totalTasksSnap, approvedClaimsSnap, completedWdSnap] = await Promise.all([
+    getCountFromServer(collection(db, "users")),
+    getCountFromServer(query(collection(db, "claimRequests"), where("status", "in", ["pending", "pending_review"]))),
+    getCountFromServer(query(collection(db, "withdrawals"), where("status", "in", ["pending", "pending_review", "approved"]))),
+    getCountFromServer(collection(db, "tasks")),
+    getCountFromServer(query(collection(db, "claimRequests"), where("status", "==", "approved"))),
+    getCountFromServer(query(collection(db, "withdrawals"), where("status", "==", "completed"))),
+  ]);
+
+  setText("db-total-users", totalUsersSnap.data().count);
+  setText("db-pending-claims", pendingClaimsSnap.data().count);
+  setText("db-pending-wd", pendingWdSnap.data().count);
+  setText("db-total-tasks", totalTasksSnap.data().count);
+  setText("db-approved-claims", approvedClaimsSnap.data().count);
+  setText("db-completed-wd", completedWdSnap.data().count);
+
+  const approvedSnap = await getDocs(query(collection(db, "claimRequests"), where("status", "==", "approved")));
+  let totalPaid = 0;
+  approvedSnap.forEach(d => totalPaid += (d.data().reward || 0));
+  setText("db-total-paid", formatVND(totalPaid));
+
+  const paidWdSnap = await getDocs(query(collection(db, "withdrawals"), where("status", "in", ["paid", "completed"])));
+  let totalWdPaid = 0;
+  paidWdSnap.forEach(d => totalWdPaid += (d.data().amount || 0));
+  setText("db-total-wd-paid", formatVND(totalWdPaid));
+
+  const fraudTodaySnap = await getCountFromServer(query(collection(db, "fraudLogs"), where("createdAt", ">=", today)));
+  setText("db-fraud-today", fraudTodaySnap.data().count);
+  const auditTodaySnap = await getCountFromServer(query(collection(db, "auditLogs"), where("createdAt", ">=", today)));
+  setText("db-audit-today", auditTodaySnap.data().count);
+
+  await loadRealChart(7);
+  await loadTopStats();
+}
+window.loadDashboard = loadDashboard;
+
+let currentChartDays = 7;
+
+/** Biểu đồ THẬT — dữ liệu từ getDashboardStats (Cloud Function tổng hợp theo ngày) */
+async function loadRealChart(days) {
+  currentChartDays = days;
+  document.querySelectorAll(".chart-toggle-btn").forEach(b => b.classList.toggle("active", parseInt(b.dataset.days) === days));
+  const el = document.getElementById("db-chart");
+  el.innerHTML = `<div class="loading-text">Đang tải biểu đồ...</div>`;
+  try {
+    const result = await fnDashboardStats({ days });
+    const series = result.data.series;
+    const maxVal = Math.max(1, ...series.map(s => s.rewardPaid + s.amountPaid));
+    el.innerHTML = series.map(s => {
+      const total = s.rewardPaid + s.amountPaid;
+      const h = Math.max(3, Math.round((total / maxVal) * 100));
+      const label = new Date(s.date).toLocaleDateString("vi-VN", { day: "2-digit", month: "2-digit" });
+      return `
+      <div class="chart-bar-wrap" title="${label}: ${formatVND(total)}">
+        <div class="chart-bar" style="height:${h}%"></div>
+        <span class="chart-label">${days > 7 ? "" : label}</span>
+      </div>`;
+    }).join("");
+  } catch (e) {
+    el.innerHTML = `<div class="loading-text">Lỗi tải biểu đồ: ${escHtml(e.message)}</div>`;
+  }
+}
+window.loadRealChart = loadRealChart;
+
+async function loadTopStats() {
+  const el = document.getElementById("db-top-stats");
+  if (!el) return;
+  el.innerHTML = `<div class="loading-text">Đang tải...</div>`;
+  try {
+    const result = await fnTopStats();
+    const { topUsers, topTasks } = result.data;
+    const renderUsers = topUsers.length === 0 ? `<div class="dash-empty">Chưa có dữ liệu</div>`
+      : topUsers.map((u, i) => `<div class="dash-row"><span class="dash-key">#${i+1} ${escHtml(u.email || u.uid)}</span><span class="dash-count" style="color:var(--success)">${formatVND(u.total)}</span></div>`).join("");
+    const renderTasks = topTasks.length === 0 ? `<div class="dash-empty">Chưa có dữ liệu</div>`
+      : topTasks.map((t, i) => `<div class="dash-row"><span class="dash-key mono">#${i+1} ${escHtml(t.taskId)}</span><span class="dash-count">${t.count} lượt</span></div>`).join("");
+    el.innerHTML = `
+      <div class="fraud-dash-grid">
+        <div class="dash-card"><div class="dash-title"><i data-lucide="trophy"></i> Top user (30 ngày)</div>${renderUsers}</div>
+        <div class="dash-card"><div class="dash-title"><i data-lucide="target"></i> Top task (30 ngày)</div>${renderTasks}</div>
+      </div>`;
+    renderIcons();
+  } catch (e) { el.innerHTML = `<div class="dash-empty">Lỗi: ${escHtml(e.message)}</div>`; }
+}
+
+// ─────────────────────────────────────────────
+// CLAIMS
+// ─────────────────────────────────────────────
+const PAGE_SIZE = 20;
+let claimsLastDoc = null, claimsCurrentPage = 1, claimsStatusFilter = "pending", claimsSearchTerm = "";
+
+window.loadClaims = async () => {
+  switchTab("claims"); clearListeners();
+  claimsCurrentPage = 1; claimsLastDoc = null;
+  await fetchClaims();
+  startClaimsRealtime();
+};
+
+async function fetchClaims(afterDoc = null) {
+  const el = document.getElementById("claims-list");
+  el.innerHTML = skeletonList(3);
+
+  const statusQuery = claimsStatusFilter === "pending" ? ["pending", "pending_review"] : [claimsStatusFilter];
+  let q = query(collection(db, "claimRequests"), where("status", "in", statusQuery), orderBy("createdAt", "desc"), limit(PAGE_SIZE));
+  if (afterDoc) q = query(q, startAfter(afterDoc));
+
+  const snap = await getDocs(q);
+  const items = [];
+  snap.forEach(d => items.push({ id: d.id, ...d.data() }));
+  claimsLastDoc = snap.docs[snap.docs.length - 1] || null;
+
+  const minRisk = parseInt(document.getElementById("claims-min-risk")?.value || "0");
+  let filtered = claimsSearchTerm
+    ? items.filter(c => c.email?.includes(claimsSearchTerm) || c.uid?.includes(claimsSearchTerm)
+        || c.taskId?.includes(claimsSearchTerm) || c.deviceId?.includes(claimsSearchTerm) || c.ip?.includes(claimsSearchTerm))
+    : items;
+  if (minRisk > 0) filtered = filtered.filter(c => (c.fraudScore || 0) >= minRisk);
+
+  renderClaims(filtered);
+  setText("claims-page-info", `Trang ${claimsCurrentPage}`);
+  document.getElementById("btn-claims-next").disabled = snap.docs.length < PAGE_SIZE;
+}
+
+function renderClaims(items) {
+  if (items.length === 0) { document.getElementById("claims-list").innerHTML = emptyState("check-circle-2", "Không có claim nào"); return; }
+  document.getElementById("claims-list").innerHTML = items.map(c => {
+    const date = c.createdAt?.toDate ? c.createdAt.toDate().toLocaleString("vi-VN") : "N/A";
+    const isDone = !["pending", "pending_review"].includes(c.status);
+    return `
+    <div class="item-card ${c.status === "pending_review" ? "risk-card" : ""}" id="claim-${c.id}">
+      <div class="item-card-head">
+        <span class="item-title">${escHtml(c.email)}</span>
+        <span class="chip green">+${formatVND(c.reward)}</span>
+      </div>
+      <div class="item-meta"><i data-lucide="hash"></i> UID: <span class="mono">${escHtml(c.uid)}</span></div>
+      <div class="item-meta"><i data-lucide="target"></i> Task: <span class="mono">${escHtml(c.taskId)}</span></div>
+      <div class="item-meta"><i data-lucide="wifi"></i> IP: <span class="mono">${escHtml(c.ip || "-")}</span></div>
+      <div class="item-meta"><i data-lucide="clock"></i> ${date}</div>
+      <div class="item-foot">
+        <span class="status-badge status-${c.status}">${statusLabel(c.status)}</span>
+        ${riskLevelChip(c.fraudScore)}
+      </div>
+      ${!isDone && (can("approve_claim") || can("reject_claim")) ? `
+      <div class="item-actions">
+        ${can("approve_claim") ? `<button class="btn-approve" onclick="window.approveClaim('${c.id}',${c.reward})"><i data-lucide="check"></i> Duyệt</button>` : ""}
+        ${can("reject_claim") ? `<button class="btn-reject" onclick="window.rejectClaim('${c.id}')"><i data-lucide="x"></i> Từ chối</button>` : ""}
+      </div>` : ""}
+    </div>`;
+  }).join("");
+  renderIcons();
+}
+
+function startClaimsRealtime() {
+  const q = query(collection(db, "claimRequests"), where("status", "in", ["pending", "pending_review"]), orderBy("createdAt", "desc"), limit(1));
+  const unsub = onSnapshot(q, snap => {
+    if (!snap.empty) fetchClaims();
+    getCountFromServer(query(collection(db, "claimRequests"), where("status", "in", ["pending", "pending_review"])))
+      .then(cnt => { const b = document.getElementById("badge-claims"); if (b) b.textContent = cnt.data().count > 0 ? cnt.data().count : ""; });
+  });
+  unsubListeners.push(unsub);
+}
+
+window.claimsNextPage = async () => { if (!claimsLastDoc) return; claimsCurrentPage++; await fetchClaims(claimsLastDoc); };
+window.claimsPrevPage = async () => { if (claimsCurrentPage <= 1) return; claimsCurrentPage--; claimsLastDoc = null; await fetchClaims(); };
+window.filterClaims = (status) => {
+  claimsStatusFilter = status;
+  document.querySelectorAll(".filter-chip[data-group='claims']").forEach(b => b.classList.toggle("active", b.dataset.val === status));
+  window.loadClaims();
+};
+window.searchClaims = () => { claimsSearchTerm = document.getElementById("search-claims").value.trim().toLowerCase(); fetchClaims(); };
+
+window.approveClaim = async (claimId, reward) => {
+  if (!confirm(`Duyệt claim +${formatVND(reward)}?`)) return;
+  const btn = document.querySelector(`#claim-${claimId} .btn-approve`);
+  if (btn) { btn.disabled = true; btn.innerHTML = spinnerHtml(); }
+  try {
+    await fnApproveClaim({ claimId });
+    showToast("success", "check-circle-2", "Đã duyệt và cộng tiền!");
+    document.getElementById(`claim-${claimId}`)?.remove();
+  } catch (e) { showToast("error", "alert-circle", e.message); if (btn) { btn.disabled = false; btn.innerHTML = `<i data-lucide="check"></i> Duyệt`; renderIcons(); } }
+};
+window.rejectClaim = async (claimId) => {
+  if (!confirm("Từ chối claim này?")) return;
+  const btn = document.querySelector(`#claim-${claimId} .btn-reject`);
+  if (btn) { btn.disabled = true; btn.innerHTML = spinnerHtml(); }
+  try {
+    await fnRejectClaim({ claimId });
+    showToast("info", "x-circle", "Đã từ chối.");
+    document.getElementById(`claim-${claimId}`)?.remove();
+  } catch (e) { showToast("error", "alert-circle", e.message); if (btn) { btn.disabled = false; btn.innerHTML = `<i data-lucide="x"></i> Từ chối`; renderIcons(); } }
+};
+
+// ─────────────────────────────────────────────
+// WITHDRAWALS — Workflow 4 bước: pending → approved → paid → completed
+// ─────────────────────────────────────────────
+let wdLastDoc = null, wdCurrentPage = 1, wdStatusFilter = "pending", wdSearchTerm = "";
+
+window.loadWithdrawals = async () => {
+  switchTab("withdrawals"); clearListeners();
+  wdCurrentPage = 1; wdLastDoc = null;
+  await fetchWithdrawals();
+  startWithdrawalsRealtime();
+};
+
+async function fetchWithdrawals(afterDoc = null) {
+  document.getElementById("withdrawals-list").innerHTML = skeletonList(3);
+  const statusQuery = wdStatusFilter === "pending" ? ["pending", "pending_review"] : [wdStatusFilter];
+  let q = query(collection(db, "withdrawals"), where("status", "in", statusQuery), orderBy("createdAt", "desc"), limit(PAGE_SIZE));
+  if (afterDoc) q = query(q, startAfter(afterDoc));
+
+  const snap = await getDocs(q);
+  const items = [];
+  snap.forEach(d => items.push({ id: d.id, ...d.data() }));
+  wdLastDoc = snap.docs[snap.docs.length - 1] || null;
+
+  const minRisk = parseInt(document.getElementById("wd-min-risk")?.value || "0");
+  const bankFilter = (document.getElementById("wd-filter-bank")?.value || "").trim().toLowerCase();
+  let filtered = wdSearchTerm
+    ? items.filter(w => w.email?.includes(wdSearchTerm) || w.uid?.includes(wdSearchTerm) || w.bankAccount?.includes(wdSearchTerm))
+    : items;
+  if (minRisk > 0) filtered = filtered.filter(w => (w.riskScore || 0) >= minRisk);
+  if (bankFilter) filtered = filtered.filter(w => w.bankName?.toLowerCase().includes(bankFilter));
+
+  renderWithdrawals(filtered);
+  setText("wd-page-info", `Trang ${wdCurrentPage}`);
+  document.getElementById("btn-wd-next").disabled = snap.docs.length < PAGE_SIZE;
+}
+
+function renderWithdrawals(items) {
+  if (items.length === 0) { document.getElementById("withdrawals-list").innerHTML = emptyState("banknote", "Không có lệnh rút nào"); return; }
+  document.getElementById("withdrawals-list").innerHTML = items.map(w => {
+    const date = w.createdAt?.toDate ? w.createdAt.toDate().toLocaleString("vi-VN") : "N/A";
+    const riskHtml = riskLevelChip(w.riskScore);
+    let actionsHtml = "";
+    if (["pending", "pending_review"].includes(w.status)) {
+      const btns = [];
+      if (can("approve_withdraw")) btns.push(`<button class="btn-approve" onclick="window.approveWithdraw('${w.id}')"><i data-lucide="check"></i> Duyệt</button>`);
+      if (can("reject_withdraw")) btns.push(`<button class="btn-reject" onclick="window.rejectWithdraw('${w.id}',${w.amount})"><i data-lucide="undo-2"></i> Hoàn tiền</button>`);
+      if (btns.length) actionsHtml = `<div class="item-actions">${btns.join("")}</div>`;
+    } else if (w.status === "approved") {
+      const btns = [];
+      if (can("mark_paid")) btns.push(`<button class="btn-approve" onclick="window.markPaid('${w.id}')"><i data-lucide="send"></i> Đã chuyển khoản</button>`);
+      if (can("reject_withdraw")) btns.push(`<button class="btn-reject" onclick="window.rejectWithdraw('${w.id}',${w.amount})"><i data-lucide="undo-2"></i> Hoàn tiền</button>`);
+      if (btns.length) actionsHtml = `<div class="item-actions">${btns.join("")}</div>`;
+    } else if (w.status === "paid") {
+      if (can("mark_completed")) actionsHtml = `<div class="item-actions"><button class="btn-approve" onclick="window.markCompleted('${w.id}')"><i data-lucide="check-check"></i> Đối soát xong</button></div>`;
+    }
+    return `
+    <div class="item-card ${w.status === "pending_review" ? "risk-card" : ""}" id="wd-${w.id}">
+      <div class="item-card-head"><span class="item-title">${escHtml(w.email)}</span><span class="chip green">${formatVND(w.amount)}</span></div>
+      <div class="item-meta"><i data-lucide="landmark"></i> ${escHtml(w.bankName)} — <span class="mono">${escHtml(w.bankAccount)}</span></div>
+      <div class="item-meta"><i data-lucide="user"></i> ${escHtml(w.bankHolder)}</div>
+      <div class="item-meta"><i data-lucide="wifi"></i> IP: <span class="mono">${escHtml(w.ip || "-")}</span></div>
+      <div class="item-meta"><i data-lucide="clock"></i> ${date}</div>
+      <div class="item-foot"><span class="status-badge status-${w.status}">${statusLabel(w.status)}</span>${riskHtml}</div>
+      ${actionsHtml}
+    </div>`;
+  }).join("");
+  renderIcons();
+}
+
+function startWithdrawalsRealtime() {
+  const q = query(collection(db, "withdrawals"), where("status", "in", ["pending", "pending_review"]), orderBy("createdAt", "desc"), limit(1));
+  const unsub = onSnapshot(q, snap => {
+    if (!snap.empty && wdStatusFilter === "pending") fetchWithdrawals();
+    getCountFromServer(query(collection(db, "withdrawals"), where("status", "in", ["pending", "pending_review"])))
+      .then(cnt => { const b = document.getElementById("badge-wd"); if (b) b.textContent = cnt.data().count > 0 ? cnt.data().count : ""; });
+  });
+  unsubListeners.push(unsub);
+}
+
+window.wdNextPage = async () => { if (!wdLastDoc) return; wdCurrentPage++; await fetchWithdrawals(wdLastDoc); };
+window.wdPrevPage = async () => { if (wdCurrentPage <= 1) return; wdCurrentPage--; wdLastDoc = null; await fetchWithdrawals(); };
+window.filterWd = (status) => {
+  wdStatusFilter = status;
+  document.querySelectorAll(".filter-chip[data-group='wd']").forEach(b => b.classList.toggle("active", b.dataset.val === status));
+  window.loadWithdrawals();
+};
+window.searchWd = () => { wdSearchTerm = document.getElementById("search-wd").value.trim().toLowerCase(); fetchWithdrawals(); };
+
+window.approveWithdraw = async (wId) => {
+  if (!confirm("Duyệt yêu cầu rút tiền này? (chưa chuyển tiền, chỉ xác nhận hợp lệ)")) return;
+  const btn = document.querySelector(`#wd-${wId} .btn-approve`);
+  if (btn) { btn.disabled = true; btn.innerHTML = spinnerHtml(); }
+  try { await fnApproveWithdraw({ withdrawId: wId }); showToast("success", "check-circle-2", "Đã duyệt! Chờ chuyển khoản."); await fetchWithdrawals(); }
+  catch (e) { showToast("error", "alert-circle", e.message); if (btn) btn.disabled = false; }
+};
+window.markPaid = async (wId) => {
+  if (!confirm("Xác nhận đã chuyển khoản thành công?")) return;
+  const btn = document.querySelector(`#wd-${wId} .btn-approve`);
+  if (btn) { btn.disabled = true; btn.innerHTML = spinnerHtml(); }
+  try { await fnMarkWithdrawPaid({ withdrawId: wId }); showToast("success", "check-circle-2", "Đã đánh dấu chuyển khoản!"); await fetchWithdrawals(); }
+  catch (e) { showToast("error", "alert-circle", e.message); if (btn) btn.disabled = false; }
+};
+window.markCompleted = async (wId) => {
+  if (!confirm("Đánh dấu hoàn tất đối soát?")) return;
+  const btn = document.querySelector(`#wd-${wId} .btn-approve`);
+  if (btn) { btn.disabled = true; btn.innerHTML = spinnerHtml(); }
+  try { await fnMarkWithdrawCompleted({ withdrawId: wId }); showToast("success", "check-check", "Đã hoàn tất!"); document.getElementById(`wd-${wId}`)?.remove(); }
+  catch (e) { showToast("error", "alert-circle", e.message); if (btn) btn.disabled = false; }
+};
+window.rejectWithdraw = async (wId, amount) => {
+  if (!confirm(`Hoàn ${formatVND(amount)} về tài khoản user?`)) return;
+  const btn = document.querySelector(`#wd-${wId} .btn-reject`);
+  if (btn) { btn.disabled = true; btn.innerHTML = spinnerHtml(); }
+  try { await fnRejectWithdraw({ withdrawId: wId }); showToast("success", "undo-2", "Đã hoàn tiền!"); document.getElementById(`wd-${wId}`)?.remove(); }
+  catch (e) { showToast("error", "alert-circle", e.message); if (btn) btn.disabled = false; }
+};
+
+// ─────────────────────────────────────────────
+// TASKS
+// ─────────────────────────────────────────────
+window.loadTasks = async () => {
+  switchTab("tasks");
+  document.getElementById("tasks-list").innerHTML = skeletonList(2);
+  const snap = await getDocs(collection(db, "tasks"));
+  const tasks = [];
+  snap.forEach(d => tasks.push({ id: d.id, ...d.data() }));
+
+  document.getElementById("tasks-list").innerHTML = tasks.length === 0 ? emptyState("clipboard-x", "Chưa có task nào")
+    : tasks.map(t => `
+      <div class="item-card" id="task-${t.id}">
+        <div class="item-card-head"><span class="item-title">${escHtml(t.title)}</span><span class="chip green">${formatVND(t.reward)}</span></div>
+        <div class="item-meta">${escHtml(t.description || "-")}</div>
+        <div class="item-meta mono" style="font-size:11px;word-break:break-all">${escHtml(t.bypassUrl)}</div>
+        <div class="item-foot"><span class="status-badge ${t.active ? "status-approved" : "status-rejected"}">${t.active ? "Đang bật" : "Đã tắt"}</span></div>
+        <div class="item-actions">
+          <button class="btn-toggle" onclick="window.toggleTask('${t.id}',${t.active})"><i data-lucide="${t.active ? "pause" : "play"}"></i> ${t.active ? "Tắt" : "Bật"}</button>
+          <button class="btn-reject" onclick="window.deleteTask('${t.id}')"><i data-lucide="trash-2"></i> Xóa</button>
+        </div>
+      </div>`).join("");
+  renderIcons();
+};
+
+window.addTask = async () => {
+  const title  = document.getElementById("new-task-title").value.trim();
+  const desc   = document.getElementById("new-task-desc").value.trim();
+  const url    = document.getElementById("new-task-url").value.trim();
+  const reward = parseInt(document.getElementById("new-task-reward").value);
+
+  if (!title || !url || !reward) { showToast("error", "alert-circle", "Điền đủ thông tin!"); return; }
+  if (reward < 1 || reward > 5000) { showToast("error", "alert-circle", "Reward phải từ 1–5000đ!"); return; }
+  if (!url.startsWith("http")) { showToast("error", "alert-circle", "URL không hợp lệ!"); return; }
+
+  const btn = document.getElementById("btn-add-task");
+  btn.disabled = true; btn.innerHTML = spinnerHtml() + " Đang thêm...";
+  try {
+    await addDoc(collection(db, "tasks"), { title, description: desc, bypassUrl: url, reward, active: true, createdAt: serverTimestamp() });
+    showToast("success", "check-circle-2", "Đã thêm task mới!");
+    ["new-task-title","new-task-desc","new-task-url","new-task-reward"].forEach(id => document.getElementById(id).value = "");
+    window.loadTasks();
+  } catch (e) { showToast("error", "alert-circle", e.message); }
+  finally { btn.disabled = false; btn.innerHTML = `<i data-lucide="plus"></i> Thêm task`; renderIcons(); }
+};
+
+window.toggleTask = async (taskId, current) => {
+  await updateDoc(doc(db, "tasks", taskId), { active: !current });
+  showToast("success", "check-circle-2", `Task đã ${!current ? "bật" : "tắt"}!`);
+  window.loadTasks();
+};
+window.deleteTask = async (taskId) => {
+  if (!confirm("Xóa task này?")) return;
+  await deleteDoc(doc(db, "tasks", taskId));
+  showToast("info", "trash-2", "Đã xóa task!");
+  document.getElementById(`task-${taskId}`)?.remove();
+};
+
+// ─────────────────────────────────────────────
+// FRAUD LOGS + DASHBOARD + TIMELINE
+// ─────────────────────────────────────────────
+let fraudLastDoc = null, fraudPage = 1, fraudSearch = "";
+
+window.loadFraud = async () => {
+  switchTab("fraud"); fraudPage = 1; fraudLastDoc = null;
+  await fetchFraud();
+};
+async function fetchFraud(afterDoc = null) {
+  document.getElementById("fraud-list").innerHTML = skeletonList(3);
+  let q = query(collection(db, "fraudLogs"), orderBy("createdAt", "desc"), limit(PAGE_SIZE));
+  if (afterDoc) q = query(q, startAfter(afterDoc));
+  const snap = await getDocs(q);
+  const items = [];
+  snap.forEach(d => items.push({ id: d.id, ...d.data() }));
+  fraudLastDoc = snap.docs[snap.docs.length - 1] || null;
+
+  const filtered = fraudSearch ? items.filter(l => l.uid?.includes(fraudSearch) || l.reason?.includes(fraudSearch)) : items;
+  setText("fraud-page-info", `Trang ${fraudPage}`);
+  document.getElementById("btn-fraud-next").disabled = snap.docs.length < PAGE_SIZE;
+
+  document.getElementById("fraud-list").innerHTML = filtered.length === 0 ? emptyState("shield-check", "Chưa có log gian lận")
+    : filtered.map(l => {
+        const date = l.createdAt?.toDate ? l.createdAt.toDate().toLocaleString("vi-VN") : "N/A";
+        return `
+        <div class="item-card fraud-card">
+          <div class="item-card-head"><span class="item-title">${escHtml(l.reason)}</span>${typeof l.score === "number" ? `<span class="chip red">${l.score}</span>` : ""}</div>
+          <div class="item-meta"><i data-lucide="hash"></i> UID: <span class="mono">${escHtml(l.uid)}</span></div>
+          <div class="item-meta"><i data-lucide="tag"></i> ${escHtml(l.action)}</div>
+          <div class="item-meta"><i data-lucide="wifi"></i> IP: <span class="mono">${escHtml(l.ip || "-")}</span></div>
+          <div class="item-meta"><i data-lucide="clock"></i> ${date}</div>
+        </div>`;
+      }).join("");
+  renderIcons();
+}
+window.fraudNextPage = async () => { if (!fraudLastDoc) return; fraudPage++; await fetchFraud(fraudLastDoc); };
+window.fraudPrevPage = async () => { if (fraudPage <= 1) return; fraudPage--; fraudLastDoc = null; await fetchFraud(); };
+window.searchFraud = () => { fraudSearch = document.getElementById("search-fraud").value.trim(); fetchFraud(); };
+
+window.loadFraudDashboard = async () => {
+  const el = document.getElementById("fraud-dashboard");
+  el.innerHTML = `<div class="loading-text">Đang tổng hợp...</div>`;
+  try {
+    const result = await fnFraudDashboard();
+    const { totalEvents, topDevices, topIps, topUids, topReasons } = result.data;
+    const renderList = (items) => items.length === 0 ? `<div class="dash-empty">Không có dữ liệu</div>`
+      : items.map(i => `<div class="dash-row"><span class="dash-key mono">${escHtml(i.key)}</span><span class="dash-count">${i.count}</span></div>`).join("");
+    el.innerHTML = `
+      <div class="fraud-dash-grid">
+        <div class="dash-card"><div class="dash-title"><i data-lucide="smartphone"></i> Top Device</div>${renderList(topDevices)}</div>
+        <div class="dash-card"><div class="dash-title"><i data-lucide="wifi"></i> Top IP</div>${renderList(topIps)}</div>
+        <div class="dash-card"><div class="dash-title"><i data-lucide="user"></i> Top UID</div>${renderList(topUids)}</div>
+        <div class="dash-card"><div class="dash-title"><i data-lucide="alert-triangle"></i> Top lý do</div>${renderList(topReasons)}</div>
+      </div>
+      <div class="dash-total">Tổng ${totalEvents} sự kiện trong 7 ngày qua</div>`;
+    renderIcons();
+  } catch (e) { el.innerHTML = `<div class="dash-empty">Lỗi: ${escHtml(e.message)}</div>`; }
+};
+
+window.loadUidTimeline = async () => {
+  const uid = document.getElementById("timeline-uid-input").value.trim();
+  const el  = document.getElementById("timeline-result");
+  if (!uid) { showToast("error", "alert-circle", "Nhập UID cần xem timeline!"); return; }
+  el.innerHTML = `<div class="loading-text">Đang tải timeline...</div>`;
+  try {
+    const result = await fnUidTimeline({ uid });
+    const events = result.data.events || [];
+    if (events.length === 0) { el.innerHTML = `<div class="dash-empty">Không có sự kiện nào</div>`; return; }
+    const typeIcon = { fraud: "alert-triangle", claim: "target", withdraw: "banknote", admin_action: "shield" };
+    const typeColor = { fraud: "red", claim: "primary", withdraw: "green", admin_action: "purple" };
+    el.innerHTML = `<div class="timeline-list">` + events.map(e => `
+      <div class="timeline-item">
+        <div class="timeline-dot" style="background:var(--${typeColor[e.type] || "text-3"})"></div>
+        <div class="timeline-content">
+          <div class="timeline-header"><span><i data-lucide="${typeIcon[e.type] || "circle"}"></i> ${escHtml(e.detail)}</span><span class="timeline-time">${e.time ? new Date(e.time).toLocaleString("vi-VN") : ""}</span></div>
+          ${e.ip ? `<div class="timeline-meta mono">IP: ${escHtml(e.ip)}${e.deviceId ? " · " + escHtml(e.deviceId) : ""}</div>` : ""}
+        </div>
+      </div>`).join("") + `</div>`;
+    renderIcons();
+  } catch (e) { el.innerHTML = `<div class="dash-empty">Lỗi: ${escHtml(e.message)}</div>`; }
+};
+
+// ─────────────────────────────────────────────
+// AUDIT LOGS
+// ─────────────────────────────────────────────
+let auditLastDoc = null, auditPage = 1;
+
+window.loadAudit = async () => {
+  switchTab("audit"); auditPage = 1; auditLastDoc = null;
+  await fetchAudit();
+};
+async function fetchAudit(afterDoc = null) {
+  document.getElementById("audit-list").innerHTML = skeletonList(3);
+  let q = query(collection(db, "auditLogs"), orderBy("createdAt", "desc"), limit(PAGE_SIZE));
+  if (afterDoc) q = query(q, startAfter(afterDoc));
+  const snap = await getDocs(q);
+  const items = [];
+  snap.forEach(d => items.push({ id: d.id, ...d.data() }));
+  auditLastDoc = snap.docs[snap.docs.length - 1] || null;
+  setText("audit-page-info", `Trang ${auditPage}`);
+  document.getElementById("btn-audit-next").disabled = snap.docs.length < PAGE_SIZE;
+
+  document.getElementById("audit-list").innerHTML = items.length === 0 ? emptyState("shield", "Chưa có log admin nào")
+    : items.map(l => {
+        const date = l.createdAt?.toDate ? l.createdAt.toDate().toLocaleString("vi-VN") : "N/A";
+        const color = l.action?.includes("REJECT") ? "red" : l.action?.includes("APPROVE") || l.action?.includes("PAID") || l.action?.includes("COMPLETED") ? "green" : "muted";
+        return `
+        <div class="item-card">
+          <div class="item-card-head"><span class="item-title">${escHtml(l.adminEmail)}</span><span class="chip ${color}">${escHtml(l.action)}</span></div>
+          <div class="item-meta"><i data-lucide="hash"></i> Target: <span class="mono">${escHtml(l.targetId)}</span></div>
+          ${l.uid ? `<div class="item-meta"><i data-lucide="user"></i> UID: <span class="mono">${escHtml(l.uid)}</span></div>` : ""}
+          <div class="item-meta"><i data-lucide="clock"></i> ${date}</div>
+        </div>`;
+      }).join("");
+  renderIcons();
+}
+window.auditNextPage = async () => { if (!auditLastDoc) return; auditPage++; await fetchAudit(auditLastDoc); };
+window.auditPrevPage = async () => { if (auditPage <= 1) return; auditPage--; auditLastDoc = null; await fetchAudit(); };
+
+// ─────────────────────────────────────────────
+// EXPORT CSV
+// ─────────────────────────────────────────────
+window.exportCSV = async (type) => {
+  const btn = document.getElementById(`btn-export-${type}`);
+  if (btn) { btn.disabled = true; btn.innerHTML = spinnerHtml() + " Đang xuất..."; }
+  try {
+    let rows = [], headers = [], filename = "";
+    if (type === "claims") {
+      headers = ["ID","Email","UID","TaskID","Reward","Status","IP","CreatedAt","ApprovedBy"]; filename = "claims.csv";
+      const snap = await getDocs(query(collection(db, "claimRequests"), orderBy("createdAt", "desc")));
+      snap.forEach(d => { const c = d.data(); rows.push([d.id, c.email, c.uid, c.taskId, c.reward, c.status, c.ip || "", c.createdAt?.toDate ? c.createdAt.toDate().toLocaleString("vi-VN") : "", c.approvedBy || c.rejectedBy || ""]); });
+    } else if (type === "withdrawals") {
+      headers = ["ID","Email","UID","Amount","BankName","BankAccount","BankHolder","Status","IP","CreatedAt","PaidBy"]; filename = "withdrawals.csv";
+      const snap = await getDocs(query(collection(db, "withdrawals"), orderBy("createdAt", "desc")));
+      snap.forEach(d => { const w = d.data(); rows.push([d.id, w.email, w.uid, w.amount, w.bankName, w.bankAccount, w.bankHolder, w.status, w.ip || "", w.createdAt?.toDate ? w.createdAt.toDate().toLocaleString("vi-VN") : "", w.paidBy || w.refundedBy || ""]); });
+    } else if (type === "audit") {
+      headers = ["ID","AdminEmail","Action","TargetID","UID","IP","Amount","CreatedAt"]; filename = "audit_logs.csv";
+      const snap = await getDocs(query(collection(db, "auditLogs"), orderBy("createdAt", "desc")));
+      snap.forEach(d => { const l = d.data(); rows.push([d.id, l.adminEmail, l.action, l.targetId, l.uid || "", l.ip || "", l.amount || "", l.createdAt?.toDate ? l.createdAt.toDate().toLocaleString("vi-VN") : ""]); });
+    } else if (type === "fraud") {
+      headers = ["ID","UID","Action","Reason","TaskID","IP","Score","CreatedAt"]; filename = "fraud_logs.csv";
+      const snap = await getDocs(query(collection(db, "fraudLogs"), orderBy("createdAt", "desc")));
+      snap.forEach(d => { const l = d.data(); rows.push([d.id, l.uid, l.action, l.reason, l.taskId || "", l.ip || "", l.score || "", l.createdAt?.toDate ? l.createdAt.toDate().toLocaleString("vi-VN") : ""]); });
+    }
+    const csv = [headers, ...rows].map(r => r.map(v => `"${String(v ?? "").replace(/"/g, '""')}"`).join(",")).join("\n");
+    const blob = new Blob(["\uFEFF" + csv], { type: "text/csv;charset=utf-8;" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob); a.download = filename; a.click(); URL.revokeObjectURL(a.href);
+    showToast("success", "download", `Đã xuất ${filename}!`);
+  } catch (e) { showToast("error", "alert-circle", "Lỗi xuất CSV: " + e.message); }
+  finally { if (btn) { btn.disabled = false; btn.innerHTML = `<i data-lucide="download"></i> Xuất CSV`; renderIcons(); } }
+};
+
+// ─────────────────────────────────────────────
+// SETTINGS — set admin + ban management
+// ─────────────────────────────────────────────
+window.openSettings = () => switchTab("settings");
+
+window.setRoleAction = async () => {
+  const email = document.getElementById("set-role-email").value.trim();
+  const role  = document.getElementById("set-role-value").value;
+  if (!email) { showToast("error", "alert-circle", "Nhập email cần phân quyền!"); return; }
+  if (!confirm(`Set vai trò "${role}" cho ${email}?`)) return;
+  const btn = document.getElementById("btn-set-role");
+  btn.disabled = true; btn.innerHTML = spinnerHtml() + " Đang xử lý...";
+  try {
+    const result = await fnSetRole({ targetEmail: email, role });
+    showToast("success", "shield-check", result.data.message);
+    document.getElementById("set-role-email").value = "";
+  } catch (e) { showToast("error", "alert-circle", e.message); }
+  finally { btn.disabled = false; btn.innerHTML = `<i data-lucide="shield-check"></i> Cập nhật vai trò`; renderIcons(); }
+};
+
+window.setAdmin = async () => {
+  const email = document.getElementById("set-admin-email").value.trim();
+  if (!email) { showToast("error", "alert-circle", "Nhập email cần set admin!"); return; }
+  if (!confirm(`Set admin cho ${email}?`)) return;
+  const btn = document.getElementById("btn-set-admin");
+  btn.disabled = true; btn.innerHTML = spinnerHtml() + " Đang xử lý...";
+  try { const result = await fnSetAdminClaim({ targetEmail: email }); showToast("success", "shield-check", result.data.message); document.getElementById("set-admin-email").value = ""; }
+  catch (e) { showToast("error", "alert-circle", e.message); }
+  finally { btn.disabled = false; btn.innerHTML = `<i data-lucide="shield-check"></i> Set Admin`; renderIcons(); }
+};
+
+window.banUidAction = async (isBan) => {
+  const uid = document.getElementById("ban-uid-input").value.trim();
+  const reason = document.getElementById("ban-uid-reason").value.trim();
+  if (!uid) { showToast("error", "alert-circle", `Nhập UID cần ${isBan ? "khóa" : "mở khóa"}!`); return; }
+  if (!confirm(`${isBan ? "Khóa" : "Mở khóa"} tài khoản UID: ${uid}?`)) return;
+  const btn = document.getElementById(isBan ? "btn-ban-uid" : "btn-unban-uid");
+  btn.disabled = true;
+  try { await fnBanUID({ uid, banned: isBan, reason }); showToast("success", "shield-check", `Đã ${isBan ? "khóa" : "mở khóa"} UID!`); document.getElementById("ban-uid-input").value = ""; document.getElementById("ban-uid-reason").value = ""; }
+  catch (e) { showToast("error", "alert-circle", e.message); }
+  finally { btn.disabled = false; }
+};
+window.banDeviceAction = async (isBan) => {
+  const deviceId = document.getElementById("ban-device-input").value.trim();
+  const reason = document.getElementById("ban-device-reason").value.trim();
+  const banType = document.getElementById("ban-device-type").value;
+  const hours = parseInt(document.getElementById("ban-device-hours").value) || 24;
+  if (!deviceId) { showToast("error", "alert-circle", `Nhập Device ID cần ${isBan ? "khóa" : "mở khóa"}!`); return; }
+  if (!confirm(`${isBan ? "Khóa" : "Mở khóa"} thiết bị: ${deviceId}?`)) return;
+  const btn = document.getElementById(isBan ? "btn-ban-device" : "btn-unban-device");
+  btn.disabled = true;
+  try { await fnBanDevice({ deviceId, banned: isBan, reason, banType, durationHours: hours }); showToast("success", "shield-check", `Đã ${isBan ? "khóa" : "mở khóa"} thiết bị!`); document.getElementById("ban-device-input").value = ""; document.getElementById("ban-device-reason").value = ""; }
+  catch (e) { showToast("error", "alert-circle", e.message); }
+  finally { btn.disabled = false; }
+};
+window.banIpAction = async (isBan) => {
+  const ip = document.getElementById("ban-ip-input").value.trim();
+  const reason = document.getElementById("ban-ip-reason").value.trim();
+  if (!ip) { showToast("error", "alert-circle", `Nhập IP cần ${isBan ? "chặn" : "bỏ chặn"}!`); return; }
+  if (!confirm(`${isBan ? "Chặn" : "Bỏ chặn"} IP: ${ip}?`)) return;
+  const btn = document.getElementById(isBan ? "btn-ban-ip" : "btn-unban-ip");
+  btn.disabled = true;
+  try { await fnBanIP({ ip, banned: isBan, reason }); showToast("success", "shield-check", `Đã ${isBan ? "chặn" : "bỏ chặn"} IP!`); document.getElementById("ban-ip-input").value = ""; document.getElementById("ban-ip-reason").value = ""; }
+  catch (e) { showToast("error", "alert-circle", e.message); }
+  finally { btn.disabled = false; }
+};
+
+// ─────────────────────────────────────────────
+// UTILS
+// ─────────────────────────────────────────────
+function formatVND(n) { return new Intl.NumberFormat("vi-VN").format(n) + "đ"; }
+
+/** Risk Level màu: 🟢 Low <30, 🟡 Medium 30-59, 🟠 High 60-89, 🔴 Critical ≥90 */
+function riskLevelChip(score) {
+  if (typeof score !== "number") return "";
+  let level, cls;
+  if (score >= 90)      { level = "Critical"; cls = "risk-critical"; }
+  else if (score >= 60) { level = "High";     cls = "risk-high"; }
+  else if (score >= 30) { level = "Medium";   cls = "risk-medium"; }
+  else                  { level = "Low";      cls = "risk-low"; }
+  return `<span class="chip ${cls}">${level} · ${score}</span>`;
+}
+function escHtml(str) {
+  if (typeof str !== "string") return String(str ?? "");
+  return str.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#039;");
+}
+function statusLabel(s) {
+  return { pending: "Chờ duyệt", pending_review: "Cần xét kỹ", approved: "Đã duyệt", paid: "Đã chuyển khoản",
+           completed: "Hoàn tất", rejected: "Từ chối (đã hoàn tiền)", cancelled: "Đã hủy (đã hoàn tiền)" }[s] || s;
+}
+function setText(id, val) { const el = document.getElementById(id); if (el) el.textContent = val; }
+function spinnerHtml() { return `<span class="btn-spinner"></span>`; }
+function skeletonList(n) { return Array(n).fill(0).map(() => `<div class="item-card skeleton-card"><div class="skel skel-title"></div><div class="skel skel-desc"></div></div>`).join(""); }
+function emptyState(icon, title) { return `<div class="empty-state"><div class="empty-icon"><i data-lucide="${icon}"></i></div><div class="empty-title">${title}</div></div>`; }
+function renderIcons() { if (window.lucide) lucide.createIcons(); }
+
+const TABS = ["dashboard","claims","withdrawals","tasks","fraud","audit","settings"];
+function switchTab(tab) {
+  clearListeners();
+  TABS.forEach(t => {
+    document.getElementById(`tab-${t}`)?.classList.toggle("active", t === tab);
+    const sec = document.getElementById(`section-${t}`);
+    if (sec) sec.style.display = t === tab ? "block" : "none";
+  });
+}
+
+function showToast(type, icon, msg) {
+  const container = document.getElementById("toast-container");
+  const el = document.createElement("div");
+  el.className = `toast toast-${type}`;
+  el.innerHTML = `<i data-lucide="${icon}"></i><span>${escHtml(msg)}</span>`;
+  container.appendChild(el);
+  if (window.lucide) lucide.createIcons({ nodes: [el] });
+  requestAnimationFrame(() => el.classList.add("show"));
+  setTimeout(() => { el.classList.remove("show"); setTimeout(() => el.remove(), 300); }, 3500);
+}
+
+document.addEventListener("DOMContentLoaded", renderIcons);
+</script>
+
+<style>
+:root {
+  --bg: #0b0f17; --bg-elevated: #111726; --surface: #161d2e; --surface-2: #1c2438;
+  --border: rgba(255,255,255,0.07); --border-strong: rgba(255,255,255,0.14);
+  --primary: #5b8def; --primary-soft: rgba(91,141,239,0.14);
+  --purple: #a78bfa; --purple-soft: rgba(167,139,250,0.14);
+  --success: #34d399; --success-soft: rgba(52,211,153,0.14);
+  --danger: #f87171; --danger-soft: rgba(248,113,113,0.14);
+  --warning: #fbbf24; --warning-soft: rgba(251,191,36,0.14);
+  --text: #eef1f8; --text-2: #9aa5bd; --text-3: #626c85;
+  --radius-lg: 20px; --radius-md: 14px; --radius-sm: 10px;
+  --shadow: 0 8px 24px rgba(0,0,0,0.35);
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: var(--bg); color: var(--text); font-family: 'Be Vietnam Pro', sans-serif; min-height: 100vh; -webkit-font-smoothing: antialiased; }
+i[data-lucide] { width: 16px; height: 16px; stroke-width: 2; }
+
+#login-screen { display: flex; align-items: center; justify-content: center; min-height: 100vh; padding: 24px; background: radial-gradient(circle at 30% 20%, rgba(248,113,113,0.08), transparent 55%), var(--bg); }
+.login-box { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg); padding: 36px 28px; width: 100%; max-width: 380px; box-shadow: var(--shadow); }
+.login-logo-icon { width: 56px; height: 56px; border-radius: 16px; background: linear-gradient(135deg, var(--danger), var(--purple)); display: flex; align-items: center; justify-content: center; margin: 0 auto 16px; }
+.login-logo-icon i { width: 28px; height: 28px; color: #fff; }
+.login-title { font-size: 19px; font-weight: 800; text-align: center; margin-bottom: 4px; }
+.login-sub { font-size: 12px; color: var(--text-2); text-align: center; margin-bottom: 26px; }
+.input-group { margin-bottom: 14px; }
+.input-group label { display: block; font-size: 12px; font-weight: 600; color: var(--text-2); margin-bottom: 6px; }
+.input-group input, .input-group select { width: 100%; background: var(--bg-elevated); border: 1.5px solid var(--border); border-radius: var(--radius-sm); padding: 12px 14px; color: var(--text); font-family: inherit; font-size: 14px; outline: none; transition: border-color .2s; }
+.input-group input:focus, .input-group select:focus { border-color: var(--primary); }
+.btn-login { width: 100%; padding: 13px; background: var(--danger); border: none; border-radius: var(--radius-sm); color: #2a0d0d; font-family: inherit; font-weight: 700; font-size: 14px; cursor: pointer; margin-top: 4px; display: flex; align-items: center; justify-content: center; gap: 8px; }
+.login-note { margin-top: 16px; padding: 11px 14px; background: var(--warning-soft); border: 1px solid rgba(251,191,36,0.25); border-radius: var(--radius-sm); font-size: 11.5px; color: #fcd34d; text-align: center; line-height: 1.6; }
+
+#admin-panel { display: none; min-height: 100vh; }
+.admin-header { background: var(--bg-elevated); border-bottom: 1px solid var(--border); padding: 12px 16px; display: flex; align-items: center; justify-content: space-between; position: sticky; top: 0; z-index: 100; backdrop-filter: blur(14px); }
+.admin-logo { display: flex; align-items: center; gap: 8px; font-weight: 800; font-size: 15px; }
+.admin-logo-icon { width: 28px; height: 28px; border-radius: 8px; background: linear-gradient(135deg, var(--danger), var(--purple)); display: flex; align-items: center; justify-content: center; }
+.admin-logo-icon i { width: 15px; height: 15px; color: #fff; }
+.admin-email-badge { font-size: 10.5px; color: var(--text-2); }
+.btn-logout-admin { background: var(--danger-soft); border: none; color: var(--danger); width: 32px; height: 32px; border-radius: var(--radius-sm); cursor: pointer; display: flex; align-items: center; justify-content: center; }
+
+.tabs { display: flex; border-bottom: 1px solid var(--border); background: var(--bg-elevated); overflow-x: auto; }
+.tab-btn { padding: 11px 14px; background: none; border: none; color: var(--text-2); font-family: inherit; font-size: 12px; font-weight: 600; cursor: pointer; border-bottom: 2px solid transparent; white-space: nowrap; flex-shrink: 0; position: relative; }
+.tab-btn.active { color: var(--primary); border-bottom-color: var(--primary); }
+.badge { position: absolute; top: 4px; right: 2px; background: var(--danger); color: #fff; border-radius: 10px; font-size: 9px; padding: 1px 5px; min-width: 16px; text-align: center; }
+.section { padding: 16px; display: none; }
+#section-dashboard { display: block; }
+
+.db-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; margin-bottom: 16px; }
+.db-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-md); padding: 14px; display: flex; align-items: center; gap: 10px; }
+.db-card-icon { width: 36px; height: 36px; border-radius: 10px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+.db-card-icon.primary { background: var(--primary-soft); color: var(--primary); }
+.db-card-icon.warning { background: var(--warning-soft); color: var(--warning); }
+.db-card-icon.danger { background: var(--danger-soft); color: var(--danger); }
+.db-card-icon.purple { background: var(--purple-soft); color: var(--purple); }
+.db-card-icon.success { background: var(--success-soft); color: var(--success); }
+.db-num { font-size: 19px; font-weight: 800; }
+.db-lbl { font-size: 10px; color: var(--text-2); margin-top: 1px; }
+
+.revenue-section { background: var(--surface); border: 1px solid rgba(52,211,153,0.2); border-radius: var(--radius-md); padding: 16px; margin-bottom: 16px; }
+.revenue-title { font-size: 11px; font-weight: 700; color: var(--success); margin-bottom: 12px; text-transform: uppercase; letter-spacing: .4px; }
+.revenue-row { display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid var(--border); font-size: 12.5px; }
+.revenue-row:last-child { border-bottom: none; }
+.revenue-val { font-weight: 700; }
+
+.chart-section { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-md); padding: 16px; margin-bottom: 16px; }
+.chart-title { font-size: 11px; font-weight: 700; color: var(--text-2); margin-bottom: 14px; text-transform: uppercase; letter-spacing: .4px; }
+.chart-title-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; }
+.chart-title-row .chart-title { margin-bottom: 0; }
+.chart-toggle-group { display: flex; gap: 4px; background: var(--surface-2); border-radius: var(--radius-sm); padding: 3px; }
+.chart-toggle-btn { padding: 5px 10px; background: none; border: none; color: var(--text-2); font-family: inherit; font-size: 10.5px; font-weight: 600; cursor: pointer; border-radius: 7px; }
+.chart-toggle-btn.active { background: var(--primary); color: #fff; }
+.chart-bars { display: flex; align-items: flex-end; gap: 8px; height: 100px; }
+.chart-bar-wrap { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 6px; height: 100%; justify-content: flex-end; }
+.chart-bar { width: 100%; background: linear-gradient(180deg, var(--primary), rgba(91,141,239,0.3)); border-radius: 6px 6px 0 0; min-height: 4px; }
+.chart-label { font-size: 9px; color: var(--text-3); }
+
+.db-refresh-btn { width: 100%; padding: 11px; background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius-sm); color: var(--text-2); font-family: inherit; font-size: 12px; font-weight: 600; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 6px; }
+
+.search-bar { display: flex; gap: 8px; margin-bottom: 12px; }
+.search-bar input { flex: 1; background: var(--bg-elevated); border: 1.5px solid var(--border); border-radius: var(--radius-sm); padding: 10px 14px; color: var(--text); font-family: inherit; font-size: 13px; outline: none; }
+.search-bar button { padding: 10px 14px; background: var(--primary-soft); border: none; border-radius: var(--radius-sm); color: var(--primary); font-weight: 700; font-size: 12px; cursor: pointer; }
+
+.filter-row { display: flex; gap: 6px; margin-bottom: 12px; flex-wrap: wrap; }
+.filter-chip { padding: 7px 14px; background: var(--surface-2); border: 1px solid var(--border); border-radius: 20px; color: var(--text-2); font-family: inherit; font-size: 11px; font-weight: 600; cursor: pointer; }
+.filter-chip.active { background: var(--primary-soft); border-color: var(--primary); color: var(--primary); }
+.mini-select, .mini-input { background: var(--bg-elevated); border: 1.5px solid var(--border); border-radius: var(--radius-sm); padding: 8px 10px; color: var(--text); font-family: inherit; font-size: 11.5px; outline: none; }
+.mini-select { flex: 0 0 auto; }
+.mini-input { flex: 1; }
+
+.pagination { display: flex; align-items: center; justify-content: center; gap: 12px; margin-top: 14px; }
+.page-btn { padding: 8px 16px; background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius-sm); color: var(--text-2); font-family: inherit; font-size: 11px; font-weight: 600; cursor: pointer; }
+.page-btn:disabled { opacity: .35; cursor: not-allowed; }
+.page-info { font-size: 12px; color: var(--text-2); }
+
+.export-btn { width: 100%; padding: 11px; background: var(--purple-soft); border: none; border-radius: var(--radius-sm); color: var(--purple); font-family: inherit; font-size: 12px; font-weight: 700; cursor: pointer; margin-top: 10px; display: flex; align-items: center; justify-content: center; gap: 6px; }
+.export-btn:disabled { opacity: .5; cursor: not-allowed; }
+
+.item-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-md); padding: 15px; margin-bottom: 10px; }
+.risk-card { border-color: rgba(251,191,36,0.35); background: linear-gradient(135deg, rgba(251,191,36,0.04), var(--surface)); }
+.fraud-card { border-color: rgba(248,113,113,0.25); }
+.item-card-head { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-bottom: 8px; }
+.item-title { font-weight: 700; font-size: 13.5px; }
+.item-meta { display: flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--text-2); margin-bottom: 4px; }
+.item-meta i { flex-shrink: 0; width: 13px; height: 13px; }
+.mono { font-family: 'Courier New', monospace; word-break: break-all; }
+.item-foot { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
+.chip { padding: 3px 9px; border-radius: 20px; font-size: 10.5px; font-weight: 700; }
+.chip.green { background: var(--success-soft); color: var(--success); }
+.chip.red { background: var(--danger-soft); color: var(--danger); }
+.chip.muted { background: var(--surface-2); color: var(--text-2); }
+.chip.risk-low { background: var(--success-soft); color: var(--success); }
+.chip.risk-medium { background: var(--warning-soft); color: var(--warning); }
+.chip.risk-high { background: rgba(251,146,60,0.14); color: #fb923c; }
+.chip.risk-critical { background: var(--danger-soft); color: var(--danger); font-weight: 800; }
+.status-badge { padding: 3px 10px; border-radius: 20px; font-size: 10.5px; font-weight: 700; }
+.status-pending, .status-pending_review { background: var(--warning-soft); color: var(--warning); }
+.status-approved { background: var(--primary-soft); color: var(--primary); }
+.status-paid, .status-completed { background: var(--success-soft); color: var(--success); }
+.status-rejected, .status-cancelled { background: var(--danger-soft); color: var(--danger); }
+
+.item-actions { display: flex; gap: 8px; margin-top: 12px; }
+.btn-approve { flex: 1; padding: 10px; background: var(--success-soft); border: none; border-radius: var(--radius-sm); color: var(--success); font-family: inherit; font-size: 11.5px; font-weight: 700; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 5px; }
+.btn-reject { flex: 1; padding: 10px; background: var(--danger-soft); border: none; border-radius: var(--radius-sm); color: var(--danger); font-family: inherit; font-size: 11.5px; font-weight: 700; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 5px; }
+.btn-toggle { flex: 1; padding: 10px; background: var(--purple-soft); border: none; border-radius: var(--radius-sm); color: var(--purple); font-family: inherit; font-size: 11.5px; font-weight: 700; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 5px; }
+.btn-approve:disabled, .btn-reject:disabled, .btn-toggle:disabled { opacity: .5; cursor: not-allowed; }
+
+.skeleton-card { display: flex; flex-direction: column; gap: 8px; }
+.skel { background: linear-gradient(90deg, var(--surface-2) 25%, #26304a 37%, var(--surface-2) 63%); background-size: 400% 100%; animation: shimmer 1.4s ease infinite; border-radius: 8px; }
+.skel-title { height: 15px; width: 55%; } .skel-desc { height: 11px; width: 85%; }
+.empty-state { text-align: center; padding: 50px 20px; }
+.empty-icon { width: 56px; height: 56px; border-radius: 16px; background: var(--surface-2); color: var(--text-3); display: flex; align-items: center; justify-content: center; margin: 0 auto 14px; }
+.empty-icon i { width: 26px; height: 26px; }
+.empty-title { font-size: 13.5px; font-weight: 600; color: var(--text-2); }
+.loading-text { text-align: center; color: var(--text-2); font-size: 12px; padding: 20px; }
+
+.add-task-form { background: var(--surface); border: 1px solid rgba(91,141,239,0.2); border-radius: var(--radius-md); padding: 16px; margin-bottom: 14px; }
+.form-title { font-size: 11px; font-weight: 700; color: var(--primary); margin-bottom: 12px; text-transform: uppercase; letter-spacing: .4px; }
+.btn-add-task { width: 100%; padding: 12px; background: var(--primary); border: none; border-radius: var(--radius-sm); color: #fff; font-family: inherit; font-weight: 700; font-size: 12.5px; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 6px; }
+.btn-add-task:disabled { opacity: .6; cursor: not-allowed; }
+
+.fraud-dash-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 10px; }
+.dash-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-md); padding: 12px; }
+.dash-title { display: flex; align-items: center; gap: 6px; font-size: 10px; font-weight: 700; color: var(--primary); margin-bottom: 8px; text-transform: uppercase; }
+.dash-row { display: flex; justify-content: space-between; padding: 4px 0; border-bottom: 1px solid var(--border); font-size: 11px; }
+.dash-row:last-child { border-bottom: none; }
+.dash-key { color: var(--text-2); flex: 1; margin-right: 8px; font-size: 10px; }
+.dash-count { color: var(--danger); font-weight: 700; }
+.dash-empty { color: var(--text-2); font-size: 12px; text-align: center; padding: 10px; }
+.dash-total { text-align: center; font-size: 11px; color: var(--text-2); margin-bottom: 12px; }
+.timeline-search-box { background: var(--surface); border: 1px solid rgba(167,139,250,0.2); border-radius: var(--radius-md); padding: 14px; margin-bottom: 14px; }
+.timeline-list { margin-top: 10px; max-height: 400px; overflow-y: auto; }
+.timeline-item { display: flex; gap: 10px; padding: 10px 0; border-bottom: 1px solid var(--border); }
+.timeline-item:last-child { border-bottom: none; }
+.timeline-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; margin-top: 5px; }
+.timeline-content { flex: 1; min-width: 0; }
+.timeline-header { display: flex; justify-content: space-between; gap: 8px; font-size: 12px; flex-wrap: wrap; }
+.timeline-time { font-size: 10px; color: var(--text-2); white-space: nowrap; }
+.timeline-meta { font-size: 10px; color: var(--text-2); margin-top: 2px; }
+
+.settings-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-md); padding: 18px; margin-bottom: 14px; }
+.settings-title { font-size: 11px; font-weight: 700; margin-bottom: 12px; text-transform: uppercase; letter-spacing: .4px; }
+.settings-desc { font-size: 11.5px; color: var(--text-2); margin-bottom: 14px; line-height: 1.6; }
+.btn-set-admin { width: 100%; padding: 12px; background: var(--warning-soft); border: 1px solid rgba(251,191,36,0.3); border-radius: var(--radius-sm); color: var(--warning); font-family: inherit; font-weight: 700; font-size: 12px; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 6px; }
+.export-section { background: var(--surface); border: 1px solid rgba(167,139,250,0.2); border-radius: var(--radius-md); padding: 16px; margin-bottom: 14px; }
+.ban-card { border-color: rgba(248,113,113,0.2); }
+.ban-actions { display: flex; gap: 8px; margin-top: 4px; }
+.btn-ban { flex: 1; padding: 11px; background: var(--danger-soft); border: none; border-radius: var(--radius-sm); color: var(--danger); font-family: inherit; font-weight: 700; font-size: 11px; cursor: pointer; }
+.btn-unban { flex: 1; padding: 11px; background: var(--success-soft); border: none; border-radius: var(--radius-sm); color: var(--success); font-family: inherit; font-weight: 700; font-size: 11px; cursor: pointer; }
+.btn-ban:disabled, .btn-unban:disabled { opacity: .5; cursor: not-allowed; }
+
+.btn-spinner { width: 13px; height: 13px; border: 2px solid rgba(255,255,255,0.3); border-top-color: currentColor; border-radius: 50%; display: inline-block; animation: spin .7s linear infinite; }
+#toast-container { position: fixed; top: 16px; left: 50%; transform: translateX(-50%); z-index: 9999; display: flex; flex-direction: column; gap: 8px; width: min(90vw, 380px); }
+.toast { display: flex; align-items: center; gap: 10px; background: var(--surface); border: 1px solid var(--border-strong); border-radius: var(--radius-sm); padding: 13px 16px; font-size: 13px; font-weight: 600; box-shadow: var(--shadow); opacity: 0; transform: translateY(-14px); transition: all .3s; }
+.toast.show { opacity: 1; transform: translateY(0); }
+.toast i { flex-shrink: 0; width: 18px; height: 18px; }
+.toast-success i { color: var(--success); } .toast-error i { color: var(--danger); } .toast-info i { color: var(--primary); }
+
+@keyframes spin { to { transform: rotate(360deg); } }
+@keyframes shimmer { 0% { background-position: 100% 0; } 100% { background-position: 0 0; } }
+</style>
+</head>
+<body>
+
+<div id="login-screen">
+  <div class="login-box">
+    <div class="login-logo-icon"><i data-lucide="shield"></i></div>
+    <div class="login-title">Admin Panel</div>
+    <div class="login-sub">TaskEarn Management System</div>
+    <div class="input-group"><label>Email admin</label><input type="email" id="login-email" placeholder="admin@email.com"></div>
+    <div class="input-group"><label>Mật khẩu</label><input type="password" id="login-pass" placeholder="••••••••"></div>
+    <button class="btn-login" onclick="doAdminLogin()"><i data-lucide="log-in"></i> Đăng nhập admin</button>
+    <div class="login-note">🔒 Chỉ tài khoản có custom claim admin=true mới vào được</div>
+  </div>
+</div>
+
+<div id="admin-panel">
+  <div class="admin-header">
+    <div style="display:flex;align-items:center;gap:8px">
+      <div class="admin-logo-icon"><i data-lucide="shield"></i></div>
+      <div><div class="admin-logo">Admin</div><div class="admin-email-badge" id="admin-email-display"></div></div>
+    </div>
+    <button class="btn-logout-admin" onclick="doAdminLogout()"><i data-lucide="log-out"></i></button>
+  </div>
+
+  <div class="tabs">
+    <button class="tab-btn active" id="tab-dashboard" onclick="loadDashboard()">Dashboard</button>
+    <button class="tab-btn" id="tab-claims" onclick="loadClaims()">Claim<span class="badge" id="badge-claims"></span></button>
+    <button class="tab-btn" id="tab-withdrawals" onclick="loadWithdrawals()">Rút tiền<span class="badge" id="badge-wd"></span></button>
+    <button class="tab-btn" id="tab-tasks" onclick="loadTasks()">Task</button>
+    <button class="tab-btn" id="tab-fraud" onclick="loadFraud()">Gian lận</button>
+    <button class="tab-btn" id="tab-audit" onclick="loadAudit()">Log Admin</button>
+    <button class="tab-btn" id="tab-settings" onclick="openSettings()">Cài đặt</button>
+  </div>
+
+  <div class="section" id="section-dashboard">
+    <div class="db-grid">
+      <div class="db-card"><div class="db-card-icon primary"><i data-lucide="users"></i></div><div><div class="db-num" id="db-total-users">-</div><div class="db-lbl">Thành viên</div></div></div>
+      <div class="db-card"><div class="db-card-icon warning"><i data-lucide="clock"></i></div><div><div class="db-num" id="db-pending-claims">-</div><div class="db-lbl">Claim chờ</div></div></div>
+      <div class="db-card"><div class="db-card-icon danger"><i data-lucide="banknote"></i></div><div><div class="db-num" id="db-pending-wd">-</div><div class="db-lbl">Rút chờ</div></div></div>
+      <div class="db-card"><div class="db-card-icon purple"><i data-lucide="target"></i></div><div><div class="db-num" id="db-total-tasks">-</div><div class="db-lbl">Tổng task</div></div></div>
+      <div class="db-card"><div class="db-card-icon success"><i data-lucide="check-circle-2"></i></div><div><div class="db-num" id="db-approved-claims">-</div><div class="db-lbl">Claim đã duyệt</div></div></div>
+      <div class="db-card"><div class="db-card-icon success"><i data-lucide="check-check"></i></div><div><div class="db-num" id="db-completed-wd">-</div><div class="db-lbl">Rút hoàn tất</div></div></div>
+      <div class="db-card"><div class="db-card-icon danger"><i data-lucide="alert-triangle"></i></div><div><div class="db-num" id="db-fraud-today">-</div><div class="db-lbl">Gian lận hôm nay</div></div></div>
+      <div class="db-card"><div class="db-card-icon primary"><i data-lucide="shield"></i></div><div><div class="db-num" id="db-audit-today">-</div><div class="db-lbl">Thao tác admin</div></div></div>
+    </div>
+    <div class="revenue-section">
+      <div class="revenue-title">Thống kê doanh thu</div>
+      <div class="revenue-row"><span>Tổng đã phát thưởng</span><span class="revenue-val" id="db-total-paid" style="color:var(--success)">-</span></div>
+      <div class="revenue-row"><span>Tổng đã rút thành công</span><span class="revenue-val" id="db-total-wd-paid" style="color:var(--danger)">-</span></div>
+    </div>
+    <div class="chart-section">
+      <div class="chart-title-row">
+        <div class="chart-title">Doanh thu theo ngày</div>
+        <div class="chart-toggle-group">
+          <button class="chart-toggle-btn active" data-days="7" onclick="loadRealChart(7)">7 ngày</button>
+          <button class="chart-toggle-btn" data-days="30" onclick="loadRealChart(30)">30 ngày</button>
+        </div>
+      </div>
+      <div class="chart-bars" id="db-chart"></div>
+    </div>
+    <div id="db-top-stats"></div>
+    <button class="db-refresh-btn" onclick="loadDashboard()"><i data-lucide="refresh-cw"></i> Làm mới Dashboard</button>
+  </div>
+
+  <div class="section" id="section-claims">
+    <div class="search-bar"><input id="search-claims" placeholder="Tìm email / UID / TaskID / Device / IP..." onkeydown="if(event.key==='Enter')searchClaims()"><button onclick="searchClaims()"><i data-lucide="search"></i></button></div>
+    <div class="filter-row">
+      <button class="filter-chip active" data-group="claims" data-val="pending" onclick="filterClaims('pending')">Đang chờ</button>
+      <button class="filter-chip" data-group="claims" data-val="approved" onclick="filterClaims('approved')">Đã duyệt</button>
+      <button class="filter-chip" data-group="claims" data-val="rejected" onclick="filterClaims('rejected')">Từ chối</button>
+    </div>
+    <div class="filter-row">
+      <select class="mini-select" id="claims-min-risk" onchange="fetchClaims()">
+        <option value="0">Mọi mức rủi ro</option>
+        <option value="30">Từ Medium (30+)</option>
+        <option value="60">Từ High (60+)</option>
+        <option value="90">Chỉ Critical (90+)</option>
+      </select>
+    </div>
+    <div id="claims-list"></div>
+    <div class="pagination"><button class="page-btn" onclick="claimsPrevPage()">← Trước</button><span class="page-info" id="claims-page-info">Trang 1</span><button class="page-btn" id="btn-claims-next" onclick="claimsNextPage()">Tiếp →</button></div>
+    <button class="export-btn" id="btn-export-claims" onclick="exportCSV('claims')"><i data-lucide="download"></i> Xuất CSV</button>
+  </div>
+
+  <div class="section" id="section-withdrawals">
+    <div class="search-bar"><input id="search-wd" placeholder="Tìm email / UID / Số TK / Ngân hàng..." onkeydown="if(event.key==='Enter')searchWd()"><button onclick="searchWd()"><i data-lucide="search"></i></button></div>
+    <div class="filter-row">
+      <button class="filter-chip active" data-group="wd" data-val="pending" onclick="filterWd('pending')">Đang chờ</button>
+      <button class="filter-chip" data-group="wd" data-val="approved" onclick="filterWd('approved')">Đã duyệt</button>
+      <button class="filter-chip" data-group="wd" data-val="paid" onclick="filterWd('paid')">Đã chuyển</button>
+      <button class="filter-chip" data-group="wd" data-val="completed" onclick="filterWd('completed')">Hoàn tất</button>
+      <button class="filter-chip" data-group="wd" data-val="rejected" onclick="filterWd('rejected')">Từ chối</button>
+      <button class="filter-chip" data-group="wd" data-val="cancelled" onclick="filterWd('cancelled')">Đã hủy</button>
+    </div>
+    <div class="filter-row">
+      <select class="mini-select" id="wd-min-risk" onchange="fetchWithdrawals()">
+        <option value="0">Mọi mức rủi ro</option>
+        <option value="30">Từ Medium (30+)</option>
+        <option value="60">Từ High (60+)</option>
+        <option value="90">Chỉ Critical (90+)</option>
+      </select>
+      <input class="mini-input" id="wd-filter-bank" placeholder="Lọc theo ngân hàng..." onkeydown="if(event.key==='Enter')fetchWithdrawals()">
+    </div>
+    <div id="withdrawals-list"></div>
+    <div class="pagination"><button class="page-btn" onclick="wdPrevPage()">← Trước</button><span class="page-info" id="wd-page-info">Trang 1</span><button class="page-btn" id="btn-wd-next" onclick="wdNextPage()">Tiếp →</button></div>
+    <button class="export-btn" id="btn-export-withdrawals" onclick="exportCSV('withdrawals')"><i data-lucide="download"></i> Xuất CSV</button>
+  </div>
+
+  <div class="section" id="section-tasks">
+    <div class="add-task-form">
+      <div class="form-title">Thêm nhiệm vụ mới</div>
+      <div class="input-group"><label>Tiêu đề</label><input type="text" id="new-task-title" placeholder="Vượt link kiếm tiền #1"></div>
+      <div class="input-group"><label>Mô tả</label><input type="text" id="new-task-desc" placeholder="Mô tả ngắn..."></div>
+      <div class="input-group"><label>Link vượt</label><input type="url" id="new-task-url" placeholder="https://link4m.co/..."></div>
+      <div class="input-group"><label>Reward (VND, tối đa 5000)</label><input type="number" id="new-task-reward" placeholder="400" min="1" max="5000"></div>
+      <button class="btn-add-task" id="btn-add-task" onclick="addTask()"><i data-lucide="plus"></i> Thêm task</button>
+    </div>
+    <div id="tasks-list"></div>
+  </div>
+
+  <div class="section" id="section-fraud">
+    <button class="db-refresh-btn" style="margin-bottom:12px" onclick="loadFraudDashboard()"><i data-lucide="bar-chart-3"></i> Xem Fraud Dashboard (7 ngày)</button>
+    <div id="fraud-dashboard"></div>
+    <div class="timeline-search-box">
+      <div class="settings-title" style="color:var(--purple)">Tra cứu Timeline theo UID</div>
+      <div class="search-bar"><input id="timeline-uid-input" placeholder="Dán UID cần điều tra..."><button onclick="loadUidTimeline()"><i data-lucide="clock"></i></button></div>
+      <div id="timeline-result"></div>
+    </div>
+    <div class="search-bar"><input id="search-fraud" placeholder="Tìm UID / lý do..." onkeydown="if(event.key==='Enter')searchFraud()"><button onclick="searchFraud()"><i data-lucide="search"></i></button></div>
+    <div id="fraud-list"></div>
+    <div class="pagination"><button class="page-btn" onclick="fraudPrevPage()">← Trước</button><span class="page-info" id="fraud-page-info">Trang 1</span><button class="page-btn" id="btn-fraud-next" onclick="fraudNextPage()">Tiếp →</button></div>
+    <button class="export-btn" id="btn-export-fraud" onclick="exportCSV('fraud')"><i data-lucide="download"></i> Xuất CSV</button>
+  </div>
+
+  <div class="section" id="section-audit">
+    <div id="audit-list"></div>
+    <div class="pagination"><button class="page-btn" onclick="auditPrevPage()">← Trước</button><span class="page-info" id="audit-page-info">Trang 1</span><button class="page-btn" id="btn-audit-next" onclick="auditNextPage()">Tiếp →</button></div>
+    <button class="export-btn" id="btn-export-audit" onclick="exportCSV('audit')"><i data-lucide="download"></i> Xuất CSV</button>
+  </div>
+
+  <div class="section" id="section-settings">
+    <div class="settings-card" id="card-set-role">
+      <div class="settings-title" style="color:var(--primary)">Phân quyền theo vai trò</div>
+      <div class="settings-desc">
+        <b>Super Admin</b>: toàn quyền + phân quyền người khác.
+        <b>Admin</b>: duyệt claim/rút, quản lý task, ban.
+        <b>Finance</b>: chỉ xử lý rút tiền.
+        <b>Moderator</b>: chỉ ban + xem gian lận.
+        <b>Support</b>: chỉ xem log.
+        <b>Viewer</b>: không có quyền thao tác, chỉ để tham khảo về sau.
+        Người được set cần đăng xuất/đăng nhập lại để nhận quyền mới.
+      </div>
+      <div class="input-group"><label>Email</label><input type="email" id="set-role-email" placeholder="user@email.com"></div>
+      <div class="input-group">
+        <label>Vai trò</label>
+        <select id="set-role-value">
+          <option value="viewer">Viewer</option>
+          <option value="support">Support</option>
+          <option value="moderator">Moderator</option>
+          <option value="finance">Finance</option>
+          <option value="admin" selected>Admin</option>
+          <option value="super_admin">Super Admin</option>
+        </select>
+      </div>
+      <button class="btn-set-admin" id="btn-set-role" onclick="setRoleAction()"><i data-lucide="shield-check"></i> Cập nhật vai trò</button>
+    </div>
+
+    <div class="settings-card">
+      <div class="settings-title" style="color:var(--warning)">Set admin nhanh (cũ)</div>
+      <div class="settings-desc">Cách nhanh để set role "admin" — tương đương chọn Admin ở trên.</div>
+      <div class="input-group"><label>Email cần set admin</label><input type="email" id="set-admin-email" placeholder="newadmin@email.com"></div>
+      <button class="btn-set-admin" id="btn-set-admin" onclick="setAdmin()"><i data-lucide="shield-check"></i> Set Admin</button>
+    </div>
+
+    <div class="settings-card ban-card" id="card-ban-uid">
+      <div class="settings-title" style="color:var(--danger)">Khóa tài khoản (Ban UID)</div>
+      <div class="input-group"><label>UID</label><input type="text" id="ban-uid-input" placeholder="UID người dùng"></div>
+      <div class="input-group"><label>Lý do</label><input type="text" id="ban-uid-reason" placeholder="VD: Gian lận claim nhiều lần"></div>
+      <div class="ban-actions">
+        <button class="btn-ban" id="btn-ban-uid" onclick="banUidAction(true)"><i data-lucide="lock"></i> Khóa</button>
+        <button class="btn-unban" id="btn-unban-uid" onclick="banUidAction(false)"><i data-lucide="unlock"></i> Mở khóa</button>
+      </div>
+    </div>
+
+    <div class="settings-card ban-card" id="card-ban-device">
+      <div class="settings-title" style="color:var(--danger)">Khóa thiết bị (Ban Device)</div>
+      <div class="input-group"><label>Device ID</label><input type="text" id="ban-device-input" placeholder="Device fingerprint ID"></div>
+      <div class="input-group"><label>Lý do</label><input type="text" id="ban-device-reason" placeholder="VD: Multi-account farming"></div>
+      <div class="input-group"><label>Loại khóa</label><select id="ban-device-type"><option value="permanent">Vĩnh viễn</option><option value="temporary">Tạm thời</option></select></div>
+      <div class="input-group"><label>Số giờ (nếu tạm thời)</label><input type="number" id="ban-device-hours" value="24"></div>
+      <div class="ban-actions">
+        <button class="btn-ban" id="btn-ban-device" onclick="banDeviceAction(true)"><i data-lucide="lock"></i> Khóa</button>
+        <button class="btn-unban" id="btn-unban-device" onclick="banDeviceAction(false)"><i data-lucide="unlock"></i> Mở khóa</button>
+      </div>
+    </div>
+
+    <div class="settings-card ban-card" id="card-ban-ip">
+      <div class="settings-title" style="color:var(--danger)">Chặn IP (Ban IP)</div>
+      <div class="input-group"><label>Địa chỉ IP</label><input type="text" id="ban-ip-input" placeholder="VD: 1.2.3.4"></div>
+      <div class="input-group"><label>Lý do</label><input type="text" id="ban-ip-reason" placeholder="VD: Spam claim từ nhiều acc"></div>
+      <div class="ban-actions">
+        <button class="btn-ban" id="btn-ban-ip" onclick="banIpAction(true)"><i data-lucide="lock"></i> Chặn</button>
+        <button class="btn-unban" id="btn-unban-ip" onclick="banIpAction(false)"><i data-lucide="unlock"></i> Bỏ chặn</button>
+      </div>
+    </div>
+
+    <div class="export-section">
+      <div class="settings-title">Xuất dữ liệu</div>
+      <button class="export-btn" onclick="exportCSV('claims')"><i data-lucide="download"></i> Xuất Claims</button>
+      <button class="export-btn" style="margin-top:8px" onclick="exportCSV('withdrawals')"><i data-lucide="download"></i> Xuất Withdrawals</button>
+      <button class="export-btn" style="margin-top:8px" onclick="exportCSV('audit')"><i data-lucide="download"></i> Xuất Audit Logs</button>
+      <button class="export-btn" style="margin-top:8px" onclick="exportCSV('fraud')"><i data-lucide="download"></i> Xuất Fraud Logs</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast-container"></div>
+</body>
+</html>

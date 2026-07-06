@@ -1,0 +1,237 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ============================================================
+    // HELPER: kiểm tra admin custom claim
+    // ============================================================
+    function isAdmin() {
+      return request.auth != null && request.auth.token.admin == true;
+    }
+
+    function isOwner(userId) {
+      return request.auth != null && request.auth.uid == userId;
+    }
+
+    // ============================================================
+    // TASKS: chỉ đọc nếu đăng nhập, chỉ admin mới tạo/sửa/xóa
+    // ============================================================
+    match /tasks/{taskId} {
+      allow read:   if request.auth != null;
+      allow write:  if isAdmin();
+    }
+
+    // ============================================================
+    // USERS: chỉ chủ tài khoản đọc/sửa, không tự sửa balance
+    // ============================================================
+    match /users/{userId} {
+      allow read: if isOwner(userId) || isAdmin();
+
+      // Không cho tự sửa balance, todayEarned, totalEarned, banned, banReason
+      allow update: if isOwner(userId)
+        && !("balance"     in request.resource.data.diff(resource.data).affectedKeys())
+        && !("todayEarned" in request.resource.data.diff(resource.data).affectedKeys())
+        && !("totalEarned" in request.resource.data.diff(resource.data).affectedKeys())
+        && !("banned"      in request.resource.data.diff(resource.data).affectedKeys())
+        && !("banReason"   in request.resource.data.diff(resource.data).affectedKeys());
+
+      allow create: if isOwner(userId);
+
+      // Admin đọc được tất cả users
+      allow read, write: if isAdmin();
+
+      // ── COMPLETED TASKS: chỉ đọc từ client, Cloud Function mới ghi ──
+      match /completedTasks/{taskId} {
+        allow read:  if isOwner(userId);
+        allow write: if false; // Cloud Function dùng Admin SDK bypass rules
+      }
+
+      // ── PENDING TASKS: chỉ Cloud Function (startTaskSession) tạo/sửa
+      // qua Admin SDK. Client chỉ đọc để hiển thị trạng thái.
+      match /pendingTasks/{taskId} {
+        allow read: if isOwner(userId);
+        allow create, update, delete: if false;
+      }
+    }
+
+    // ============================================================
+    // WITHDRAWALS:
+    //   - Client KHÔNG tạo nữa — Cloud Function tạo qua Admin SDK
+    //   - Client chỉ đọc withdrawal của mình
+    //   - Admin đọc/sửa tất cả
+    // ============================================================
+    match /withdrawals/{wId} {
+      allow read:   if request.auth != null && resource.data.uid == request.auth.uid;
+      allow read:   if isAdmin();
+      // Mọi write (kể cả từ admin.html) đều đi qua Cloud Function
+      // dùng Admin SDK bypass rules — client-side write luôn bị chặn.
+      allow create, update, delete: if false;
+    }
+
+    // ============================================================
+    // CLAIM REQUESTS:
+    //   - Client KHÔNG tạo nữa — Cloud Function tạo qua Admin SDK
+    //   - Client đọc claim của mình
+    //   - Admin đọc/sửa tất cả
+    // ============================================================
+    match /claimRequests/{reqId} {
+      allow read: if request.auth != null && resource.data.uid == request.auth.uid;
+      allow read: if isAdmin();
+      // Cloud Function tạo/sửa qua Admin SDK → client-side write luôn bị chặn.
+      allow create, update, delete: if false;
+    }
+
+    // ============================================================
+    // RATE LIMITS: Cloud Function ghi, client chỉ đọc của mình
+    // ============================================================
+    match /rateLimits/{docId} {
+      // Client không được đọc/ghi rate limit của người khác
+      allow read:  if request.auth != null && docId.matches(request.auth.uid + "_.*");
+      allow write: if false; // chỉ Cloud Function ghi
+    }
+
+    // ============================================================
+    // FRAUD LOGS: chỉ admin đọc, Cloud Function ghi
+    // ============================================================
+    match /fraudLogs/{logId} {
+      allow read:  if isAdmin();
+      allow write: if false;
+    }
+
+    // ============================================================
+    // AUDIT LOGS: lịch sử thao tác admin — chỉ admin đọc,
+    // chỉ Cloud Function ghi (Admin SDK bypass rules)
+    // ============================================================
+    match /auditLogs/{logId} {
+      allow read:  if isAdmin();
+      allow write: if false;
+    }
+
+    // ============================================================
+    // DAILY LIMITS: giới hạn claim/ngày — chỉ Cloud Function ghi,
+    // client không cần đọc trực tiếp (Function trả lỗi resource-exhausted)
+    // ============================================================
+    match /dailyLimits/{docId} {
+      allow read:  if isAdmin();
+      allow write: if false;
+    }
+
+    // ============================================================
+    // DEVICES: chống multi-account — chỉ admin đọc, Cloud Function ghi
+    // ============================================================
+    match /devices/{deviceId} {
+      allow read:  if isAdmin();
+      allow write: if false;
+
+      match /history/{historyId} {
+        allow read:  if isAdmin();
+        allow write: if false;
+      }
+    }
+
+    // ============================================================
+    // VELOCITY: theo dõi tốc độ tạo tài khoản/thiết bị — chỉ admin đọc
+    // ============================================================
+    match /velocity/{docId} {
+      allow read:  if isAdmin();
+      allow write: if false;
+    }
+
+    // ============================================================
+    // IDEMPOTENCY: khóa chống xử lý trùng — chỉ Cloud Function đọc/ghi
+    // ============================================================
+    match /idempotency/{docId} {
+      allow read, write: if false;
+    }
+
+    match /securityEvents/{uid} {
+      allow read:  if isAdmin() || (request.auth != null && request.auth.uid == uid);
+      allow write: if false;
+    }
+
+    // ============================================================
+    // PAYMENT PROFILES: hồ sơ thanh toán — chỉ chủ tài khoản đọc,
+    // chỉ Cloud Function ghi (qua savePaymentProfile, có validate +
+    // khoá rút tiền khi đổi)
+    // ============================================================
+    match /paymentProfiles/{uid} {
+      allow read:  if isAdmin() || (request.auth != null && request.auth.uid == uid);
+      allow write: if false;
+    }
+
+    // ============================================================
+    // NOTIFICATIONS: thông báo trong app — user đọc thông báo của mình,
+    // đánh dấu đã đọc được (chỉ field isRead), còn lại chỉ Cloud Function ghi
+    // ============================================================
+    match /notifications/{notifId} {
+      allow read: if request.auth != null && resource.data.uid == request.auth.uid;
+      allow update: if request.auth != null && resource.data.uid == request.auth.uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(["isRead", "readAt"]);
+      allow create, delete: if false;
+      allow read, write: if isAdmin();
+    }
+
+    // ============================================================
+    // CHUẨN BỊ CẤU TRÚC CHO TÍNH NĂNG TƯƠNG LAI (chưa có UI, chỉ đặt
+    // rules trước để không phải sửa cấu trúc gốc khi triển khai sau này)
+    // ============================================================
+
+    // Referral: mã giới thiệu + hoa hồng
+    match /referrals/{uid} {
+      allow read:  if isAdmin() || (request.auth != null && request.auth.uid == uid);
+      allow write: if false;
+    }
+
+    // Daily Reward: điểm danh hàng ngày
+    match /dailyRewards/{docId} {
+      allow read:  if isAdmin() || (request.auth != null && docId.matches(request.auth.uid + '_.*'));
+      allow write: if false;
+    }
+
+    // Banner: admin đăng thông báo/sự kiện, mọi người dùng đã đăng nhập đọc được
+    match /banners/{bannerId} {
+      allow read:  if request.auth != null;
+      allow write: if isAdmin();
+    }
+
+    // Ticket Support: người dùng tạo ticket, chỉ đọc/sửa ticket của mình;
+    // admin đọc/sửa tất cả để trả lời
+    match /tickets/{ticketId} {
+      allow read:   if isAdmin() || (request.auth != null && resource.data.uid == request.auth.uid);
+      allow create: if request.auth != null && request.resource.data.uid == request.auth.uid;
+      allow update: if isAdmin();
+      allow delete: if false;
+    }
+
+    // ============================================================
+    // IP REGISTRY: đếm số tài khoản đăng ký / IP — chỉ admin đọc
+    // ============================================================
+    match /ipRegistry/{ipId} {
+      allow read:  if isAdmin();
+      allow write: if false;
+    }
+
+    // ============================================================
+    // REGISTER LIMITS: giới hạn đăng ký/ngày theo thiết bị
+    // ============================================================
+    match /registerLimits/{docId} {
+      allow read:  if isAdmin();
+      allow write: if false;
+    }
+
+    // ============================================================
+    // BANNED IPS: danh sách IP bị chặn — chỉ admin đọc
+    // ============================================================
+    match /bannedIps/{ipId} {
+      allow read:  if isAdmin();
+      allow write: if false;
+    }
+
+    // ============================================================
+    // Block tất cả còn lại
+    // ============================================================
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
