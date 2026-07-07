@@ -16,7 +16,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
 
       - name: Install Firebase CLI
         run: npm install -g firebase-tools
@@ -35,4 +35,4 @@ jobs:
         run: |
           echo "$GOOGLE_APPLICATION_CREDENTIALS_JSON" > firebase-key.json
           export GOOGLE_APPLICATION_CREDENTIALS="$(pwd)/firebase-key.json"
-          firebase deploy --project ${{ secrets.FIREBASE_PROJECT_ID }} --non-interactive.
+          firebase deploy --project ${{ secrets.FIREBASE_PROJECT_ID }}
