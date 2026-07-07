@@ -17,46 +17,11 @@
       ]
     },
     {
-      "collectionGroup": "fraudLogs",
-      "queryScope": "COLLECTION",
-      "fields": [
-        { "fieldPath": "createdAt", "order": "DESCENDING" }
-      ]
-    },
-    {
-      "collectionGroup": "auditLogs",
-      "queryScope": "COLLECTION",
-      "fields": [
-        { "fieldPath": "createdAt", "order": "DESCENDING" }
-      ]
-    },
-    {
       "collectionGroup": "pendingTasks",
       "queryScope": "COLLECTION_GROUP",
       "fields": [
         { "fieldPath": "used", "order": "ASCENDING" },
         { "fieldPath": "expireAt", "order": "ASCENDING" }
-      ]
-    },
-    {
-      "collectionGroup": "dailyLimits",
-      "queryScope": "COLLECTION",
-      "fields": [
-        { "fieldPath": "date", "order": "ASCENDING" }
-      ]
-    },
-    {
-      "collectionGroup": "registerLimits",
-      "queryScope": "COLLECTION",
-      "fields": [
-        { "fieldPath": "date", "order": "ASCENDING" }
-      ]
-    },
-    {
-      "collectionGroup": "idempotency",
-      "queryScope": "COLLECTION",
-      "fields": [
-        { "fieldPath": "createdAt", "order": "ASCENDING" }
       ]
     },
     {
