@@ -35,4 +35,4 @@ jobs:
         run: |
           echo "$GOOGLE_APPLICATION_CREDENTIALS_JSON" > firebase-key.json
           export GOOGLE_APPLICATION_CREDENTIALS="$(pwd)/firebase-key.json"
-          firebase deploy --project ${{ secrets.FIREBASE_PROJECT_ID }}
+          firebase deploy --only hosting,firestore --project ${{ secrets.FIREBASE_PROJECT_ID }}
